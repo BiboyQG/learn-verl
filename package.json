@@ -1,0 +1,54 @@
+{
+  "name": "learn-verl-docs",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "sync:docs": "node scripts/sync-docs.mjs",
+    "docs:build": "docusaurus build docs-site --out-dir ../.docusaurus-build",
+    "docs:stage": "node scripts/stage-docs.mjs",
+    "docs:validate": "node scripts/validate-docs.mjs",
+    "dev": "npm run docs:build && npm run docs:stage && WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
+    "build": "npm run docs:build && npm run docs:validate && npm run docs:stage && WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
+    "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
+  },
+  "dependencies": {
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.37.1",
+    "@docusaurus/core": "^3.10.2",
+    "@docusaurus/preset-classic": "^3.10.2",
+    "@docusaurus/theme-mermaid": "^3.10.2",
+    "@easyops-cn/docusaurus-search-local": "^0.55.3",
+    "@eslint/js": "9.39.4",
+    "@mermaid-js/layout-elk": "^0.1.9",
+    "@next/eslint-plugin-next": "16.2.6",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.26",
+    "eslint": "9.39.4",
+    "eslint-plugin-jsx-a11y": "6.10.2",
+    "eslint-plugin-react": "7.37.5",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "16.4.0",
+    "jsdom": "^30.0.1",
+    "katex": "^0.18.3",
+    "react-server-dom-webpack": "19.2.6",
+    "rehype-katex": "^7.0.1",
+    "remark-math": "^6.0.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.59.3",
+    "vinext": "1.0.0-beta.2",
+    "vite": "8.0.13",
+    "wrangler": "4.92.0"
+  },
+  "type": "module"
+}
