@@ -63,6 +63,7 @@ const sourceTreePrefix = `https://github.com/verl-project/verl/tree/${commit}/`;
 const sourceLinkCount =
   html.split(sourceLinkPrefix).length - 1 + html.split(sourceTreePrefix).length - 1;
 const katexCount = (html.match(/class="katex/g) ?? []).length;
+const katexErrorCount = (html.match(/class="katex-error/g) ?? []).length;
 const javascriptDirectory = path.join(build, "assets/js");
 const javascriptFiles = (await readdir(javascriptDirectory)).filter((name) => name.endsWith(".js"));
 const javascript = (
@@ -77,6 +78,9 @@ if (sourceLinkCount < 850) {
 }
 if (katexCount < 50) {
   throw new Error(`Expected at least 50 KaTeX nodes, found ${katexCount}.`);
+}
+if (katexErrorCount > 0) {
+  throw new Error(`Found ${katexErrorCount} KaTeX rendering errors.`);
 }
 if (mermaidCount < 37) {
   throw new Error(`Expected at least 37 Mermaid markers, found ${mermaidCount}.`);

@@ -77,11 +77,30 @@ $$
 z_{t+1}=f_\theta(x_0,\ldots,x_t)
 $$
 
+**公式含义：** 模型读完当前位置及之前的 token 后，为“下一个 token 可能是什么”给词表中的每个候选项打一个原始分数；这些分数还不是概率。
+
+**符号说明：**
+
+- $z_{t+1}$ 是模型在第 $t+1$ 个位置输出的整组 logits；下标 $t+1$ 表示“当前位置的下一位”。
+- $f_\theta$ 表示语言模型这个计算函数，$\theta$ 表示模型当前的全部参数（也就是训练会更新的权重）。
+- $x_0,\ldots,x_t$ 表示从第 0 个位置到第 $t$ 个位置的已有 token；$x$ 是 token，数字下标是位置，$\ldots$ 表示省略中间连续的项。
+- 等号表示右边的模型计算结果就是左边的 logits。
+
 经过 temperature、top-k、top-p 等处理后得到采样分布 `π_rollout`，从中采出 `x_{t+1}`。被选中 token 的 log probability 是：
 
 $$
-\log \pi_{rollout}(x_{t+1}\mid x_{\le t})
+\log \pi_{\mathrm{rollout}}(x_{t+1}\mid x_{\le t})
 $$
+
+**公式含义：** 在已经看到前面所有 token 的条件下，rollout 实际采样分布给刚选中的下一个 token 分配了多大概率，再对这个概率取对数。结果通常不大于 0；越接近 0，表示该 token 在这个分布下越可能被选中。
+
+**符号说明：**
+
+- $\pi_{\mathrm{rollout}}$ 表示推理后端实际用来采样的概率分布；希腊字母 $\pi$ 常用来表示策略，直立的下标 `rollout` 说明这里特指 rollout 时的策略。
+- $\log$ 表示自然对数；它把概率转换为 log probability。
+- $x_{t+1}$ 是这一步实际选中的下一个 token，下标含义与上一式相同。
+- $x_{\le t}$ 表示位置不超过 $t$ 的全部 token，也就是 $x_0,\ldots,x_t$；$\le$ 表示“小于或等于”。
+- 竖线 $\mid$ 表示“在……条件下”：右边是已经知道的上下文，左边是要计算概率的 token。
 
 生成一个长度为 `R` 的 response，就有 `R` 个被采样 token，也应有 `R` 个逐 token log probability。verl 的 backend 返回的核心结构正是：
 
@@ -112,8 +131,18 @@ TokenOutput(
 一个 rollout replica 是一个可以独立接收请求的推理服务实例。普通情况下，一个 replica 占用的 worker/GPU 数为：
 
 $$
-world\_size_{replica}=TP\times DP\times PP
+\mathrm{world\_size}_{\mathrm{replica}}=TP\times DP\times PP
 $$
+
+**公式含义：** 一个普通 rollout replica 需要的 worker/GPU 数，等于张量并行、数据并行和流水线并行规模的乘积。例如任一并行规模翻倍，单个 replica 的资源占用也会相应翻倍。
+
+**符号说明：**
+
+- $\mathrm{world\_size}_{\mathrm{replica}}$ 是单个 replica 的总 worker/GPU 数；`world_size` 使用直立字体表示一个完整变量名，下标 `replica` 说明统计范围是“一个 replica”。
+- $TP$ 是 tensor parallel size（张量并行规模），表示一份模型的张量计算拆到多少个 worker/GPU 上。
+- $DP$ 是 data parallel size（数据并行规模），表示有多少份并行处理不同请求或数据的模型副本。
+- $PP$ 是 pipeline parallel size（流水线并行规模），表示模型按层被切成多少个流水线阶段。
+- $\times$ 是乘号，表示三个并行维度的资源数量要相乘，而不是相加。
 
 计算发生在 [`RolloutReplica.__init__`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L93-L117)。server manager 再用总 GPU 数除以每个 replica 的 footprint，得到 replica 数量，见 [`LLMServerManager._initialize_llm_servers`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L499-L558)。
 
@@ -130,8 +159,18 @@ $$
 如果启用 prefill/decode disaggregation，footprint 会变成：
 
 $$
-(TP_{prefill}\times N_{prefill}+TP_{decode}\times N_{decode})\times DP\times PP
+(TP_{\mathrm{prefill}}\times N_{\mathrm{prefill}}+TP_{\mathrm{decode}}\times N_{\mathrm{decode}})\times DP\times PP
 $$
+
+**公式含义：** prefill 和 decode 分离后，要先分别算出两个阶段占用的资源数并相加，再乘上数据并行和流水线并行规模。括号里是一个 rollout replica 内部的 prefill/decode 基础资源总和，整个公式才是该 rollout replica 的 footprint。
+
+**符号说明：**
+
+- $TP_{\mathrm{prefill}}$ 是每个 prefill 子副本的张量并行规模，$N_{\mathrm{prefill}}$ 是这类子副本的数量；直立下标 `prefill` 表示“读取并处理完整 prompt”的阶段。
+- $TP_{\mathrm{decode}}$ 是每个 decode 子副本的张量并行规模，$N_{\mathrm{decode}}$ 是这类子副本的数量；直立下标 `decode` 表示“逐个生成后续 token”的阶段。这里的两类“子副本”都位于一个外层 rollout replica 内部。
+- $TP_{\mathrm{prefill}}\times N_{\mathrm{prefill}}$ 和 $TP_{\mathrm{decode}}\times N_{\mathrm{decode}}$ 分别是两个阶段的 worker/GPU 数；$+$ 把两部分资源相加。
+- 圆括号表示先计算括号内的 prefill 与 decode 资源总和，再做外层乘法。
+- $DP$、$PP$ 和 $\times$ 与上一式含义相同：分别是数据并行规模、流水线并行规模和乘法。
 
 当前只有 vLLM 和 SGLang 支持该路径，见 [`get_rollout_replica_class`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L383-L408) 与配置校验 [`rollout.py:L339-L342`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L339-L342)。
 

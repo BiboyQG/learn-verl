@@ -94,14 +94,26 @@ value_model
 
 actor 表示当前策略 $\pi_\theta$。它承担两种训练侧计算：
 
+> **公式含义：** 这里把 actor 写成“一套由当前可训练参数决定的概率规则”：给定已经看到的 token，它会为下一个 token 的各个候选值分配概率。
+>
+> **符号说明：** `π`（读作 pi）表示策略，也就是模型的概率分布规则；下标 `θ`（读作 theta）表示 actor 的整组可训练参数。下标表示“这套策略由这些参数决定”，不是相乘。
+
 - forward-only：重算 trajectory 中 token 的 `old_log_probs`、entropy；
 - train：根据 advantage 和 PPO/GRPO loss 做 backward、更新 $\theta$。
+
+> **公式含义（更新参数）：** 这里的单个符号指 optimizer 要改变 actor 的参数，使策略更符合当前 loss 给出的优化方向。
+>
+> **符号说明：** `θ` 仍是上面那组 actor 参数的统称，不是某一个标量；它通常包含模型中许多权重张量。
 
 在当前统一 engine 路径里，actor 的 `TrainingWorkerConfig.model_type` 是 `language_model`。外层 [`ActorRolloutRefWorker.init_model`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L585-L641) 创建内部 `TrainingWorker`，安装 PPO loss，然后初始化具体 model engine。
 
 ### 2.2 Reference policy：冻结的比较基准
 
 reference policy 通常表示 $\pi_{ref}$，用于 KL reward 或 KL loss。它仍然是带 LM head 的 `language_model`，不是 `value_model`；区别在于它只做 forward，不需要 optimizer update。
+
+> **公式含义：** 这个公式表示“作为比较基准的那套策略概率分布”，训练时用它衡量 actor 偏离基准的程度。
+>
+> **符号说明：** `π` 表示策略；下标 `ref` 是 reference（参考）的缩写，用来区分它与正在更新的 actor 策略。这个下标是名称标签，不表示乘法；KL 指两种概率分布之间的差异度量。
 
 Engine 的公共配置明确保留了 `forward_only`，见 [`EngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L77-L117)。例如 Megatron 初始化时若 `forward_only=True`，就不创建 optimizer、scheduler 和 checkpoint manager，见 [`megatron/transformer_impl.py:463-469`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L463-L469)。
 
@@ -111,6 +123,10 @@ LoRA 还有一个重要优化：reference 不一定是第二份模型。如果 a
 
 critic 近似价值函数 $V_\phi$，在 GAE 中用来估计 advantage/return。它是独立参数 $\phi$、独立 optimizer 的 `value_model`，输出每个 token 的 scalar value，而不是词表 logits。
 
+> **公式含义：** 第一个公式表示 critic 用自己的参数，根据当前 token 上下文预测“从这里继续下去大约能获得多少未来回报”；后面的单个符号专门指这组 critic 参数。
+>
+> **符号说明：** `V` 是 value（价值）函数；下标 `φ`（读作 phi）是 critic 的整组可训练参数，表示价值预测由这些参数决定；单独出现的 `φ` 仍指同一组参数。它与 actor 的 `θ` 分开训练，两者不是同一个变量。
+
 V1 把 critic 配成独立的 `TrainingWorker(model_type="value_model")`，见 [`trainer_base.py:248-271`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L248-L271)。是否需要 critic 由 [`need_critic`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/utils.py#L96-L107) 决定：默认只有 GAE 自动启用；GRPO 一类不依赖 value model 的算法通常不创建 critic。
 
 这会直接限制后端选择：一个后端只有 `language_model` 注册但没有 `value_model` 注册时，可以训练 actor，却不能通过当前统一路径训练 critic。
@@ -118,6 +134,10 @@ V1 把 critic 配成独立的 `TrainingWorker(model_type="value_model")`，见 [
 ### 2.4 Rollout 也使用“策略”，为什么不属于这里的 training engine？
 
 rollout 的确也执行策略 $\pi$，但工作负载是逐 token 自回归生成，而不是对完整 trajectory 做 loss/backward。因此它走独立的 [`BaseRollout` registry](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L29-L109)，不经过 `EngineRegistry`。
+
+> **公式含义：** 这里的公式泛指 rollout 用来逐 token 采样的策略概率分布，并未指定它是训练前还是训练后的某个参数版本。
+>
+> **符号说明：** `π` 表示策略；这里没有参数下标，意味着作者只强调“它是一套策略”，不在这个句子里区分具体权重版本。
 
 先用一张表固定边界：
 
@@ -451,6 +471,10 @@ $$
 world\_size \approx DP \times TP \times PP \times CP
 $$
 
+> **公式含义：** 在这个简化的 dense Megatron 场景中，训练总进程数大致等于四个并行轴大小的乘积。例如每个轴分别取 2、2、1、1 时，总进程数约为 4。
+>
+> **符号说明：** `world_size` 是参加分布式训练的总进程数，通常一个进程对应一个 GPU rank；`≈` 表示“近似等于”，说明这不是所有后端都必须满足的恒等式；`DP`、`TP`、`PP`、`CP` 分别是数据、张量、流水线、上下文并行的规模；`×` 是乘法，表示把四个独立并行轴的规模组合起来。
+
 但加入 EP、HSDP replicate/shard、virtual PP 或动态 CP 后，各轴可能嵌套或共享 process group。此时必须读取 backend 建出的 device mesh，不能继续盲乘所有配置值。
 
 ---
@@ -539,6 +563,10 @@ mini_batch_size_per_gpu = mini_batch_size // engine.get_data_parallel_size()
 $$
 max\_token\_len\_per\_gpu \times sequence/context\ parallel\ size
 $$
+
+> **公式含义：** 动态切分时，engine 把“单个 GPU 的基础 token 预算”乘以参与分担序列计算的并行 rank 数，得到当前并行组可共同承受的总 token/workload 预算。
+>
+> **符号说明：** `max_token_len_per_gpu` 是配置给单个 GPU 的最大 token 长度或等价工作量预算；`×` 表示乘法；`sequence/context parallel size` 是当前后端采用的序列并行（SP）或上下文并行（CP）组大小。名称中的 `/` 表示“根据后端二选一”，不是除法；`size` 表示该并行组包含多少个 rank。
 
 这意味着动态 micro-batch 的行数不是常量：一批可以装很多短序列，也可能只能装一条长序列。`same_micro_num_in_dp=True` 会让不同 DP replica 拥有相同 micro-batch 数，避免 collective 或 pipeline schedule 次数不一致。
 
@@ -700,6 +728,10 @@ KV cache 每个 token 的粗略大小：
 $$
 2(K,V) \times layers \times kv\_heads \times head\_dim \times bytes
 $$
+
+> **公式含义：** 这个乘积估算一条序列中“每缓存一个 token”需要多少字节：每层都要为该 token 保存 key 和 value，并覆盖所有 KV head 及每个 head 的向量维度。
+>
+> **符号说明：** `2(K,V)` 中的 `2` 表示 key（`K`）和 value（`V`）两份缓存，括号只是标明这两类张量；每个 `×` 都表示把各维度规模相乘；`layers` 是 Transformer 层数；`kv_heads` 是每层的 KV head 数；`head_dim` 是每个 head 的向量长度；`bytes` 是每个数值元素占用的字节数，例如 BF16 为 2 字节。下划线只是把多词变量名连起来。
 
 若有 32 层、8 个 KV heads、head dim 128、BF16：
 
@@ -893,6 +925,10 @@ TP/PP/CP rank
 10. 选择后端时，以“registry + import + model support + 实际实现 + e2e 验证”为证据链，而不是看名字或 YAML 文件。
 
 下一章将沿着本章最后的权重同步箭头继续：训练 engine 更新出 $\theta_{new}$ 后，vLLM/SGLang 等 rollout server 如何 sleep、接收参数、恢复 KV cache 并开始下一轮采样。
+
+> **公式含义：** 这个公式表示 actor 完成一次或多次 optimizer update 后得到的新版参数，rollout server 随后需要加载这版参数。
+>
+> **符号说明：** `θ` 表示 actor 的整组参数；下标 `new` 表示“更新后的新版本”，用来和更新前参数区分。它是版本标签，不表示相乘。
 
 ---
 
