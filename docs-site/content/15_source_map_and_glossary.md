@@ -186,7 +186,7 @@ verl 对外部 TransferQueue 的转换适配集中在 [`transferqueue_utils.py`]
 - [`need_reward_model`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/utils.py#L89-L94)
 - [`need_critic`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/utils.py#L96-L107)
 
-再看 V1 trainer 初始化 resource pool/worker group 的部分（[`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L733-L879)）。
+再分别看 V1 trainer 如何建立 role→resource pool 映射（[`_init_resource_pool_mgr`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L733-L787)），以及如何创建、spawn worker groups 并初始化各 role（[`PPOTrainer._setup`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L229-L369)）。
 
 Ray 层的两个核心对象是：
 
@@ -199,9 +199,11 @@ worker 侧从 [`TrainingWorker`](https://github.com/verl-project/verl/blob/d33dd
 
 不要从第三方 backend 内部开始。先读 verl 自己的两层接口：
 
-1. [`BaseRollout` 与 rollout registry](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L29-L107)：按 `rollout.name`、`mode` 选择 adapter。
+1. [`BaseRollout` 与 adapter registry](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L29-L109)：按 `rollout.name`、`mode` 选择 adapter。
 2. [`LLMServerManager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L453-L618)：创建/管理 rollout replicas 与客户端路由。
-3. [`RolloutReplica`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L70-L180)：不同 backend server replica 的共同生命周期。
+3. [`RolloutReplica`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L70-L180)：不同 backend server replica 的共同生命周期；[`RolloutReplicaRegistry/get_rollout_replica_class`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L302-L408) 独立选择 server replica。
+
+因此新增 backend 时必须同时接通 adapter registry 与 replica registry；只加入 `_ROLLOUT_REGISTRY`，`LLMServerManager` 仍无法按新名字创建 server replica。
 
 然后才进入具体 backend：
 
@@ -283,8 +285,9 @@ engine：forward、loss、backward、optimizer step
 4. [`get_policy_loss_fn`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L50-L85)：从 registry 选择 vanilla、GSPO、SAPO 等 loss。
 5. [`compute_policy_loss_vanilla`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L1283-L1375)：标准 clipped PPO policy loss。
 6. [`workers/utils/losses.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L19-L205)：把 model output、mask、advantage 与 policy/value loss 接起来。
+7. [`BaseEngine.train_batch`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/base.py#L113-L132)：依次执行 zero grad、forward/backward 与 optimizer step。
 
-FSDP backend 的设备移动与 forward 入口是 [`FSDPEngine.forward_step`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L1507-L1561)。其他 backend 有相同职责，但实现不同。
+FSDP backend 先在 [`FSDPEngine.forward_backward_batch`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L700-L748) 切 micro-batch 并做 backward，再由具体的 [`FSDPEngineWithLMHead.forward_step`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L1507-L1559) 移动设备、forward 和计算 loss，最后进入 [`FSDPEngine.optimizer_step`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L759-L805)。基类 `FSDPEngine.forward_step` 本身只抛 `NotImplementedError`；其他 backend 有相同职责，但实现不同。
 
 ### 问题 12：为什么一个远程方法会自动按 DP 切 batch？
 
@@ -332,7 +335,7 @@ trainer registry 根据 `trainer.v1.trainer_mode` 选择类（[`register_trainer
 
 ### 问题 15：checkpoint/resume 在哪里？
 
-trainer 的加载与保存编排在 [`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1080-L1260)。这里不仅涉及 model/optimizer，还涉及：
+trainer 的加载、恢复 in-flight prompts 与保存编排在 [`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L789-L958)。这里不仅涉及 model/optimizer，还涉及：
 
 - global step。
 - DataLoader state。
@@ -347,13 +350,13 @@ trainer 的加载与保存编排在 [`trainer_base.py`](https://github.com/verl-
 | --- | --- | --- | --- |
 | 自定义 dataset | 继承 `torch.utils.data.Dataset` | [`get_dataset_class`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/dataset/rl_dataset.py#L566-L590) | [`test_rl_dataset_on_cpu.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/utils/dataset/test_rl_dataset_on_cpu.py) |
 | 新 rule reward | Python function | [`get_custom_reward_fn`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/reward.py#L50-L86) | [`tests/experimental/reward_loop/reward_fn.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/experimental/reward_loop/reward_fn.py) |
-| 新 reward manager | `RewardManagerBase` | [`resolve_reward_manager_cls`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/reward.py#L89-L108) | [`test_registry_on_cpu.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/workers/reward_manager/test_registry_on_cpu.py) |
+| 新 reward manager | `RewardManagerBase` | [`resolve_reward_manager_cls`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/reward.py#L89-L108) → [当前 V1/V0 共用的 `register/get_reward_manager_cls`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_manager/registry.py#L21-L53) | [当前 reward-loop 行为测试](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/experimental/reward_loop/test_rate_limited_reward_manager_on_cpu.py) |
 | 新 tool | `BaseTool` 或 function tool | [`load_all_tools`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/tools/tool_registry.py#L83-L101) | [`test_mixed_tools_on_cpu.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/tools/test_mixed_tools_on_cpu.py) |
 | 新 AgentLoop | `AgentLoopBase` | [`@register(agent_name)`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L483-L494) | [`test_basic_agent_loop.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/experimental/agent_loop/test_basic_agent_loop.py) |
 | 新 advantage estimator | estimator function | [`@register_adv_est`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L113-L150) | [`test_core_algos_on_cpu.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/trainer/ppo/test_core_algos_on_cpu.py) |
 | 新 policy loss | loss function | [`@register_policy_loss`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L50-L85) | 同上 |
 | 新 V1 trainer mode | 继承 `PPOTrainer` | [`@register_trainer`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1830-L1857) | 对比三个内置 trainer |
-| 新 rollout backend | `BaseRollout`/replica | [`get_rollout_class`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L88-L107) | backend 专属 tests |
+| 新 rollout backend | `BaseRollout` adapter + `RolloutReplica` | [adapter registry/`get_rollout_class`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L88-L109) + [`RolloutReplicaRegistry/get_rollout_replica_class`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L302-L408)；确保注册模块被 import | backend 专属 tests |
 | 新 model engine | `BaseEngine` | [`EngineRegistry`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/base.py#L337-L443) | engine/worker tests |
 | 新 weight-sync backend | `CheckpointEngine` | [`CheckpointEngineRegistry`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/checkpoint_engine/base.py#L49-L94) | [`tests/checkpoint_engine`](https://github.com/verl-project/verl/tree/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/checkpoint_engine) |
 
@@ -409,8 +412,9 @@ trainer 的加载与保存编排在 [`trainer_base.py`](https://github.com/verl-
 
 | 术语 | 小白定义 | 不要混淆 | 源码落点 |
 | --- | --- | --- | --- |
-| Controller / driver | 决定阶段顺序、发远程调用的单一控制进程 | 通常不执行大模型 forward | [`TaskRunnerV1`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/main_ppo.py#L103-L164) |
-| Worker | 真正执行某类计算的 Ray actor/process | 一个 role 可能有多个 workers | [`Worker`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/base/worker.py#L76-L145) |
+| Launcher / Ray driver | 执行 `main()/run_ppo()`，初始化 Ray、创建远程 controller actor 并等待它完成 | 与 `TaskRunnerV1` 不在同一个 OS process | [`main/run_ppo`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/main_ppo.py#L34-L100) |
+| Controller | 远程 `TaskRunnerV1` Ray actor；持有 trainer/manager，决定训练阶段顺序 | 不是 launcher/Ray driver，也通常不执行大模型 forward | [`TaskRunnerV1`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/main_ppo.py#L103-L164) |
+| Worker | 通过 WorkerGroup/RPC 暴露某类计算的逻辑对象；可能是 Ray actor，也可能是 colocated actor 内的普通 Python 对象 | 外层 `WorkerDict` actor/process 与内层 logical worker 不是同一层 | [`Worker`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/base/worker.py#L76-L145)、[`create_colocated_worker_cls`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L987-L1029) |
 | WorkerGroup | 对一组 workers 的调用与收集封装 | 不等于 PyTorch process group | [`RayWorkerGroup`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L418-L560) |
 | Role | actor/rollout/ref/critic 等逻辑职责 | role 可以 colocate 在同一个 worker 进程 | [`Role`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/utils.py#L27-L73) |
 | Resource pool | Ray 层的 GPU 资源与 role placement 描述 | 不负责 tensor sharding 算法 | [`ResourcePoolManager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L185-L270) |
@@ -418,7 +422,7 @@ trainer 的加载与保存编排在 [`trainer_base.py`](https://github.com/verl-
 | Tensor parallel / TP | 一个 layer 的 tensor 计算跨设备切分 | 同一 TP group 通常看到同一 data shard | [`MegatronEngine`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L78-L180) |
 | Pipeline parallel / PP | 不同 layer stage 放在不同设备 | 会产生 pipeline bubble 与 micro-batch 调度 | 同上 |
 | Context parallel / CP | 长序列维度跨设备切分 | 与 data parallel 不同 | [`McoreEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L150-L195) |
-| Expert parallel / EP | MoE experts 跨设备分布 | 与 top-k routing 本身不是一回事 | [`FSDPEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L296-L405) |
+| Expert parallel / EP | MoE experts 跨设备分布 | 与 top-k routing 本身不是一回事 | [`VeOmniEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L296-L405) |
 | FSDP | PyTorch 参数/梯度/optimizer state sharding backend | 是训练 engine，不是 rollout server | [`FSDPEngine`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L87-L180) |
 | Megatron | 支持 TP/PP/CP/EP 等组合并行的训练 backend | 不等于 Ray 调度层 | [`MegatronEngine`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L78-L180) |
 | Model engine | 屏蔽 FSDP/Megatron/VeOmni 等差异的训练/推断接口 | 与 vLLM rollout engine 职责不同 | [`BaseEngine`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/base.py#L30-L120) |
@@ -437,7 +441,7 @@ trainer 的加载与保存编排在 [`trainer_base.py`](https://github.com/verl-
 | Tool instance | 某条 trajectory 的有状态工具会话 | 全局 tool object 可为多条 trajectory 创建实例 | [`BaseTool`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/tools/base_tool.py#L43-L93) |
 | Hydra config group | 可组合替换的一组 YAML 配置 | 命令行 override 只改最终 composed config | [`ppo_trainer.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/ppo_trainer.yaml#L1-L70) |
 | OmegaConf | Hydra 使用的结构化配置对象 | runtime dataclass 是另一层表示 | [`omega_conf_to_dataclass`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/config.py#L23-L47) |
-| Checkpoint | 可恢复训练的持久化 model/optimizer/data state | 不等于每步 actor→rollout weight sync | [`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1080-L1260) |
+| Checkpoint | 可恢复训练的持久化 model/optimizer/data state | 不等于每步 actor→rollout weight sync | [`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L789-L958) |
 | Checkpoint engine | 训练 engine 与 rollout replica 之间的权重传输机制 | 名字含 checkpoint，但常用于每步同步 | [`CheckpointEngineManager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/checkpoint_engine/base.py#L361-L526) |
 | Sleep/wake | colocated rollout 为释放权重/KV cache 进行的生命周期切换 | 不是停止整个 Ray cluster | 同上 |
 
@@ -453,14 +457,14 @@ Ray actor、异步协程和多进程训练会让交互式断点变得困难。�
 | [`AgentLoopWorkerTQ._run_prompt`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L149) | `n` 在哪里展开？ | `uid`、`n`、`session_id`、`sampling_params` |
 | [`ToolAgentLoop.run`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L124-L206) | 每样本可见哪些工具？ | `tool_selection`、active tools/schemas、turn counters |
 | [`_handle_generating_state`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L225-L305) | 模型返回了什么？ | request id、prompt length、generated ids、parsed calls |
-| [`_handle_processing_tools_state`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L307-L404) | 工具如何改变上下文？ | function name/args、tool response/reward、mask 增量 |
+| [`_handle_processing_tools_state`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L307-L451) | 工具如何改变上下文？ | function name/args、tool response/reward、mask 增量 |
 | [`AgentLoopWorkerTQ._agent_loop_postprocess`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L150-L227) | TQ 中具体写了哪些字段？ | key、field shapes、tag lengths/status |
 | [`ReplayBuffer.sample`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L404-L494) | 为什么在等、丢弃或 refill？ | pending/running/finished/failure sets、selected uids |
 | [`_balance_batch`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1453-L1477) | 为什么顺序变了？ | `seq_len`、DP size、partition indices、padding tags |
 | [`_compute_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1588-L1647) | reward 怎样变成 advantage？ | selected fields、padded shapes、uid groups、mask sums |
 | [`_update_actor`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1672-L1711) | effective mini-batch 是多少？ | configured size、`rollout.n`、epochs、shuffle |
 | [`TrainingWorker.train_mini_batch`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L241-L320) | 每个 DP rank 实际处理多少？ | DP size/rank、local batch、local mini size、iteration count |
-| [`FSDPEngine.forward_step`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L1507-L1561) | 何时上 GPU、loss 输入是什么？ | device、nested lengths、loss mask、advantages |
+| [`FSDPEngineWithLMHead.forward_step`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L1507-L1559) | 何时上 GPU、loss 输入是什么？ | device、nested lengths、loss mask、advantages |
 | [`CheckpointEngineManager.update_weights`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/checkpoint_engine/base.py#L486-L526) | actor 权重怎样到 rollout？ | backend、global step、replica state、sync metrics |
 
 ### 推荐的 shape 日志
@@ -550,7 +554,7 @@ rg -n "KVBatchMeta|BatchMeta" verl/trainer verl/utils verl/single_controller
 ### 找 registry/插件入口
 
 ```bash
-rg -n "REGISTRY|def register|@register" verl/trainer/ppo verl/workers verl/experimental verl/tools
+rg -n "REGISTRY|def register|@register" verl/trainer/ppo verl/workers verl/experimental verl/tools verl/checkpoint_engine
 ```
 
 ### 找最小行为测试
@@ -568,7 +572,10 @@ rg --files tests | rg "protocol|rl_dataset|agent_loop|replay_buffer|core_algos|c
 目标：不用运行程序，从源码写出：
 
 ```text
-Hydra main -> Ray TaskRunnerV1 -> PPOTrainer -> AgentLoopManagerTQ -> fit
+Hydra main -> run_ppo -> TaskRunnerV1.run
+  -> trainer_cls(...); trainer.init()
+  -> TaskRunnerV1.init_agent_loop_manager()
+  -> trainer.fit(agent_loop_manager)
 ```
 
 要求：为每个箭头标出调用函数，并找出 V1/V0 分支条件。

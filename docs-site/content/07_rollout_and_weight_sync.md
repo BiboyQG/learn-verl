@@ -36,7 +36,7 @@
 推理 rollout：保存适合 decoding 的权重布局和 KV cache；负责用 θ_rollout 生成 token
 ```
 
-每次 actor 更新后，需要把新参数从 `θ` 同步到 `θ_rollout`。这就是 checkpoint engine / weight sync 子系统存在的原因。
+actor 到达配置的参数同步点后，需要把新参数从 `θ` 同步到 `θ_rollout`。同步 trainer 通常每个外层 step 做一次；`separate_async` 则可以先在一个外层 step 中完成 [`parameter_sync_step` 次 `_step_once()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L509-L534)，再于 [`on_step_end()` 单次同步](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L161-L165)。这就是 checkpoint engine / weight sync 子系统存在的原因。
 
 ```mermaid
 flowchart LR
@@ -61,7 +61,7 @@ flowchart LR
 
 - rollout 抽象与正式 backend registry：[`verl/workers/rollout/base.py:L29-L109`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L29-L109)
 - replica 与部署模式：[`verl/workers/rollout/replica.py:L39-L141`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L39-L141)
-- server manager、client 和负载均衡：[`verl/workers/rollout/llm_server.py:L46-L278`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L46-L278)
+- server manager、client 和负载均衡：[`GlobalRequestLoadBalancer` 与 client](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L46-L450)、[`LLMServerManager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L453-L608)
 - actor 与 rollout 的组合 worker：[`verl/workers/engine_workers.py:L446-L470`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L446-L470)
 - checkpoint engine 抽象：[`verl/checkpoint_engine/base.py:L49-L205`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/checkpoint_engine/base.py#L49-L205)
 
@@ -156,7 +156,7 @@ $$
 
 当前内置 rollout backend 虽然保留了 `pipeline_model_parallel_size` 字段，但 vLLM、SGLang、TRT-LLM 都会拒绝 `PP > 1`，见 [`RolloutConfig.__post_init__`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L317-L321)。所以当前常见公式实际上是 `TP × DP`。
 
-如果启用 prefill/decode disaggregation，footprint 会变成：
+如果启用 prefill/decode disaggregation，server manager 会先用下式做通用的 footprint bookkeeping：
 
 $$
 (TP_{\mathrm{prefill}}\times N_{\mathrm{prefill}}+TP_{\mathrm{decode}}\times N_{\mathrm{decode}})\times DP\times PP
@@ -172,7 +172,7 @@ $$
 - 圆括号表示先计算括号内的 prefill 与 decode 资源总和，再做外层乘法。
 - $DP$、$PP$ 和 $\times$ 与上一式含义相同：分别是数据并行规模、流水线并行规模和乘法。
 
-当前只有 vLLM 和 SGLang 支持该路径，见 [`get_rollout_replica_class`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L383-L408) 与配置校验 [`rollout.py:L339-L342`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L339-L342)。
+当前只有 vLLM 和 SGLang 支持该路径，见 [`get_rollout_replica_class`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L383-L408) 与配置校验 [`rollout.py:L339-L342`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L339-L342)。但在本章固定的源码快照中，上式不代表这些维度已经可任意组合：两个 backend 都要求 $N_{\mathrm{prefill}}=1$、$DP=1$、$PP=1$，而且整个 PD replica 必须放进单个节点。因此当前真正可执行的 footprint 是 $TP_{\mathrm{prefill}}+TP_{\mathrm{decode}}\times N_{\mathrm{decode}}$。具体限制见 [`vllm_pd_replica.py:L62-L99`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/vllm_rollout/vllm_pd_replica.py#L62-L99) 和 [`sglang_pd_replica.py:L62-L87`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/sglang_rollout/sglang_pd_replica.py#L62-L87)；vLLM 在此快照还只接受 `nixl` 或 `mooncake` transfer backend。
 
 ---
 
@@ -270,13 +270,14 @@ replica registry 也只注册这三个名字，见 [`replica.py:L320-L408`](http
 
 当前答案是：**Hugging Face Transformers 仍是模型、tokenizer、chat template 和部分训练实现的重要基础，但 `hf` 不是当前 V1 registry 中的一等 rollout backend。**
 
-仓库仍导出 [`HFRollout`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/__init__.py#L15-L20)，它直接调用 `module.generate()`，也仍有测试；但：
+仓库仍导出 [`HFRollout`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/__init__.py#L15-L20)，它的旧实现直接调用 `module.generate()`，仓库也仍保留相应测试文件；但：
 
 - 它不在 `_ROLLOUT_REGISTRY` 中，不能走当前 `get_rollout_class(name, mode)` 正式路径。
+- 它没有实现 `BaseRollout` 要求的 `resume()`、`update_weights()` 和 `release()` 三个抽象异步接口，而且旧构造函数也没有向当前基类传入必需参数，见 [`base.py:L29-L73`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L29-L73) 和 [`hf_rollout.py:L39-L51`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/hf_rollout.py#L39-L51)。所以按当前类层次直接实例化也会失败，不能把现存旧测试当作可用性证据。
 - 文件自己标记了待重构，并说明 FSDP HybridShard 下可能 hang，见 [`hf_rollout.py:L14-L18`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/hf_rollout.py#L14-L18)。
 - 它采用旧的 dense `DataProto` + 同步 `generate_sequences()` 接口，见 [`hf_rollout.py:L39-L51`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/hf_rollout.py#L39-L51)。
 
-`NaiveRollout` 也类似：源码存在，但不在当前正式 registry。阅读旧教程时，应把这些类当作 legacy/test/reference implementation，而不是 V1 生产主路径。
+`NaiveRollout` 也类似：源码存在，但不在当前正式 registry，也没有实现三个抽象控制接口，见 [`naive_rollout.py:L36-L51`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/naive/naive_rollout.py#L36-L51)。阅读旧教程时，应把这些类当作未与当前抽象对齐的 legacy/reference code，而不是可直接实例化的 V1 生产路径。
 
 > 配置文件 [`rollout.yaml:L4`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L4) 的注释仍列出了 `hf`。这是注释与当前 registry 不一致的例子，判断真实支持边界应以 Python registry 和配置校验为准。
 
@@ -326,20 +327,20 @@ sequenceDiagram
 
 ### 6.1 Dataset 不再提前 tokenize rollout prompt
 
-当前 RL dataset 的 `__getitem__` 主要返回 `raw_prompt` message list；chat template 被移到 AgentLoop 中。它只保留一个临时 dummy tensor 兼容旧 `DataProto`，见 [`rl_dataset.py:L386-L411`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/dataset/rl_dataset.py#L386-L411)。
+当前 RL dataset 的 `__getitem__` 不再提前返回 tokenized rollout prompt；chat template 被移到 AgentLoop 中。它从完整 `row_dict` 出发，新增 `raw_prompt` message list 和一个兼容旧 `DataProto` 的临时 `dummy_tensor`，同时保留 data source、reward、`extra_info` 等原始行元数据，并新增 `index`、`tools_kwargs` 和 `interaction_kwargs`，见 [`rl_dataset.py:L386-L411`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/dataset/rl_dataset.py#L386-L411)。
 
 V1 trainer 为每个 prompt 分配唯一 `uid`，把 prompt 状态注册进 TransferQueue，然后 fire-and-forget 地交给 AgentLoop，见 [`trainer_base.py:L1315-L1361`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1315-L1361)。
 
 ### 6.2 `n` 不是 backend 一次返回 n 个 completion
 
-在当前 TQ AgentLoop 中，`rollout.n` 会为同一 prompt 启动 `n` 个独立 session/task：
+在当前 TQ AgentLoop 中，训练 prompt 默认读取 `rollout.n`，验证 prompt 默认读取 `rollout.val_kwargs.n`；如果样本带有 `__rollout_n__`，该值还会覆盖相应默认值。最终得到的 `n` 会为同一 prompt 启动 `n` 个独立 session/task：
 
 ```python
 for session_id in range(n):
     create_task(run_agent_loop(..., session_id=session_id))
 ```
 
-具体实现在 [`AgentLoopWorkerTQ._run_prompt`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L148)。所以 GRPO 的多条回答在系统里是多条独立 trajectory，而不是依赖 backend 的 `num_return_sequences=n`。
+具体实现在 [`AgentLoopWorkerTQ._run_prompt`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L148)。所以训练时 GRPO 的多条回答在系统里是多条独立 trajectory，而不是依赖 backend 的 `num_return_sequences=n`。
 
 ### 6.3 sampling 参数如何一路传到底层
 
@@ -358,8 +359,8 @@ sampling_params = {
 源码见 [`agent_loop_tq.py:L59-L76`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L59-L76)。几点细节：
 
 - 当前这个路径固定传 `repetition_penalty=1.0`；它不是从 `RolloutConfig.repetition_penalty` 读取的。
-- per-sample `__do_sample__=False` 会被编码成 `temperature=0, top_p=1, top_k=-1`，而不是把布尔 `do_sample` 传给 backend，见 [`agent_loop_tq.py:L107-L126`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L126)。
-- validation 会用 `val_kwargs` 覆盖 temperature/top-p/top-k。
+- 对训练样本，per-sample `__do_sample__=False` 会被编码成 `temperature=0, top_p=1, top_k=-1`，而不是把布尔 `do_sample` 传给 backend；精确参数见 [`agent_loop_tq.py:L41-L44`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L41-L44)，应用分支见 [`L107-L126`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L126)。
+- validation 不会根据这个 per-sample flag 切换 greedy，而是用 `val_kwargs` 覆盖 temperature/top-p/top-k。
 - 每个 backend 再把统一字典翻译为自己的 API。
 
 backend 翻译边界：
@@ -386,7 +387,7 @@ response_mask:      [  1,     1,     0,     0,     1  ]
 rollout_log_probs:  [lpA,   lpB,   0.0,   0.0,   lpC ]
 ```
 
-模型 token 被追加 mask `1` 和 backend logprob，见 [`tool_agent_loop.py:L262-L280`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L262-L280)；工具 response token 被追加 mask `0` 和 logprob `0.0`，见 [`tool_agent_loop.py:L433-L449`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L433-L449)。结束时再按 `response_mask` 的长度把初始 prompt 与完整 response 切开，见 [`tool_agent_loop.py:L176-L204`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L176-L204)。
+在普通的逐段拼接路径中，模型 token 被追加 mask `1` 和 backend logprob，见 [`tool_agent_loop.py:L262-L280`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L262-L280)；工具 response token 被追加 mask `0` 和 logprob `0.0`，见 [`tool_agent_loop.py:L433-L449`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L433-L449)。启用 Continuous Token 时，两类 token 会先经过 merge，然后由 `align_response_metadata()` 按同样语义对齐：assistant token 为 `1` 并保留采样 logprob，non-assistant 与边界 token 为 `0`/`0.0`，见 [`agent_loop.py:L322-L368`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L322-L368) 和 [`continuous_token.py:L300-L350`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tokenizer/continuous_token.py#L300-L350)。结束时再按 `response_mask` 的长度把初始 prompt 与完整 response 切开，见 [`tool_agent_loop.py:L176-L204`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L176-L204)。
 
 这里的 `response_mask` 后续就是 loss mask 的基础：工具输出提供上下文，但不应该被当作 actor 自己采取的 action 来优化。
 
@@ -490,11 +491,13 @@ prompt  = [EOS]
 response = [EOS]
 input_ids shape = [2]
 response_mask = [0]
-reward/logprob = 0
+loss_mask = [0]
+rm_scores = [0.0]
+rollout_log_probs = [0.0]
 tag.is_padding = true
 ```
 
-实现见 [`padding_utils.py:L70-L124`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/padding_utils.py#L70-L124) 与 [`upsample_batch_to_divisible_size`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/padding_utils.py#L127-L198)。它解决的是“样本数整除”，不是“token 长度对齐”；不要把两者混为一谈。
+实现见 [`padding_utils.py:L70-L124`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/padding_utils.py#L70-L124) 与 [`upsample_batch_to_divisible_size`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/padding_utils.py#L127-L198)。这里显式初始化为 0 的 logprob 字段是 `rollout_log_probs`；后续 actor/ref forward 仍可能算出非零的 old/ref/current logprob，但它们会被全 0 的 `response_mask` / `loss_mask` 屏蔽。这种 padding 解决的是“样本数整除”，不是“token 长度对齐”；不要把两者混为一谈。
 
 ---
 
@@ -535,7 +538,14 @@ old_log_probs = rollout_log_probs
 
 即使权重名义上相同，也不要假设 `rollout_log_probs == old_log_probs`。推理 backend 和训练 engine 可能使用不同 kernel、dtype、logits 处理与并行布局。vLLM 的 `logprobs_mode` 默认还是 `processed_logprobs`，见 [`RolloutConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L196-L212)。
 
-完整 trainer step 的顺序是：sample → reward → balance → old logprob → ref logprob → value → advantage → critic update → actor update，见 [`trainer_base.py:L536-L586`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L536-L586)。
+reward 的位置取决于部署方式：启用异步 reward worker 时，AgentLoop 会先算 reward、把完整 trajectory 写入 TQ/replay buffer，trainer 随后再 sample，见 [`agent_loop_tq.py:L150-L227`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L150-L227) 与 [`agent_loop.py:L961-L1023`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L961-L1023)。只有 colocated reward 分支是在 sample 后补算 reward。因此两条顺序分别是：
+
+```text
+异步 reward：generation → reward → TQ/replay buffer → sample → balance → old/ref logprob → value → advantage → critic/actor update
+colocated reward：generation → TQ/replay buffer → sample → reward → balance → old/ref logprob → value → advantage → critic/actor update
+```
+
+sample 之后的条件分支见 [`trainer_base.py:L536-L586`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L536-L586)。
 
 ---
 
@@ -587,12 +597,18 @@ sequenceDiagram
     participant SA as ServerAdapter
     participant IN as Inference Engine
 
-    TR->>SA: resume([weights])
+    TR->>AR: update_weights(global_steps, mode=naive)
+    opt rollout.free_cache_engine
+        AR->>SA: resume([weights])
+    end
     AR-->>SA: get_per_tensor_param() generator
     SA->>IN: update_weights(...)
     IN->>IN: clear prefix/KV caches, set global_steps
     opt actor parameter offload
-    TR->>SA: resume([kv_cache])
+        AR->>AR: offload model parameters to CPU
+    end
+    opt rollout.free_cache_engine
+        AR->>SA: resume([kv_cache])
     end
 ```
 
@@ -688,7 +704,7 @@ update weights -> resume generation
 
 ### 12.3 `trainer_mode=separate_async`：rollout 有独立 GPU
 
-该模式要求 `rollout.nnodes > 0` 且 checkpoint backend 不能是 `naive`，见 [`trainer_separate_async.py:L39-L67`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L39-L67)。它会创建 standalone rollout server 和独立 checkpoint manager，见 [`L81-L101`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L81-L101)。
+该模式要求 `rollout.nnodes > 0`、`rollout.n_gpus_per_node > 0` 且 checkpoint backend 不能是 `naive`。它还强制要求 `data.train_batch_size == trainer.v1.separate_async.parameter_sync_step * actor_rollout_ref.actor.ppo_mini_batch_size`；如果启用 reward model，则必须使用独立的 reward resource pool，即 `reward.reward_model.enable_resource_pool=True`。这些硬性校验见 [`trainer_separate_async.py:L39-L67`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L39-L67)。它会创建 standalone rollout server 和独立 checkpoint manager，见 [`L81-L101`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L81-L101)。
 
 standalone rollout 可以在 actor 训练时继续生成；step 结束后通过 NCCL/NIXL/Mooncake 等同步新权重。代码还提供把 hybrid actor GPU 临时加入/移出 load balancer 的切换框架，见 [`L180-L203`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L180-L203)，但当前 `should_switch_to_rollout()` 固定返回 `False`，动态闲置 GPU spillover 策略仍未实现，见 [`L205-L207`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L205-L207)。
 
@@ -714,7 +730,7 @@ actor_rollout_ref:
     temperature: 1.0
     top_p: 1.0
     top_k: -1
-    n: 4                     # 每个 prompt 启动 4 条独立 trajectory
+    n: 4                     # 每个训练 prompt 默认启动 4 条；验证读取 val_kwargs.n，样本仍可覆盖
     calculate_log_probs: true
 
     tensor_model_parallel_size: 2
@@ -731,9 +747,9 @@ actor_rollout_ref:
       update_weights_bucket_megabytes: 2048
 ```
 
-字段定义集中在 [`RolloutConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L145-L274)，默认 YAML 及说明见 [`verl/trainer/config/rollout/rollout.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml)。
+主要 rollout 字段定义在 [`RolloutConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L145-L274)；上面嵌套的 `checkpoint_engine.backend` 和 `update_weights_bucket_megabytes` 定义在 [`CheckpointEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L125-L141)。默认 YAML 及说明见 [`rollout.yaml:L1-L270`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L1-L270) 与 [`rollout.yaml:L271-L300`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L271-L300)。
 
-如果切换为 `separate_async`，还需为 standalone rollout 配置 `nnodes` / `n_gpus_per_node`，并把 checkpoint engine 改为目标环境实际可用的非 `naive` backend。
+如果切换为 `separate_async`，还需为 standalone rollout 配置 `nnodes` / `n_gpus_per_node`，把 checkpoint engine 改为目标环境实际可用的非 `naive` backend，并配置 `trainer.v1.separate_async.parameter_sync_step` 使上述 batch-size 等式成立。它在默认配置中是 4，见 [`ppo_trainer.yaml:L239-L246`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/ppo_trainer.yaml#L239-L246)。
 
 ---
 
@@ -741,10 +757,10 @@ actor_rollout_ref:
 
 第一次读源码时，不建议从数千行 backend server 实现开始。按一条 trajectory 的调用链追：
 
-1. [`RLHFDataset.__getitem__`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/dataset/rl_dataset.py#L386-L411)：确认最初只有 `raw_prompt`。
+1. [`RLHFDataset.__getitem__`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/dataset/rl_dataset.py#L386-L411)：确认 rollout prompt 尚未 tokenize，batch 保留原始行元数据并新增 `raw_prompt` / `dummy_tensor` 等字段。
 2. [`PPOTrainer._submit_batch_to_rollout`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1345-L1361)：确认 prompt 怎样进入 TQ/AgentLoop。
 3. [`AgentLoopWorkerTQ.generate_sequences`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L59-L149)：确认 sampling 和 `n`。
-4. [`ToolAgentLoop`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L150-L206)：确认模型 token 与工具 token 如何拼接。
+4. [`ToolAgentLoop` 模型 token 追加](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L262-L280)与[工具 token 追加](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L415-L449)：确认两类 token 如何拼接。
 5. [`LLMServerClient.generate`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L228-L278)：确认 routing 与统一 `TokenOutput`。
 6. 选择一个 backend 的 `generate`：vLLM、SGLang 或 TRT-LLM。
 7. [`AgentLoopWorkerTQ._agent_loop_postprocess`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L150-L227)：确认 TQ 中的 shape。

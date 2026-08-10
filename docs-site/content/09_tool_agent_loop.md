@@ -57,7 +57,7 @@ flowchart LR
 ```yaml
 actor_rollout_ref:
   rollout:
-    # V1 中，一个初始 prompt 实际产生多少条独立 trajectory。
+    # V1 训练中，一个初始 prompt 默认产生多少条独立 trajectory。
     n: 4
 
     agent:
@@ -88,7 +88,7 @@ row["agent_name"] = "tool_agent"
 - dataset 顶层 `agent_name`；
 - 或 `rollout.agent.default_agent_loop`。
 
-因此，仅设置 `multi_turn.enable=true` **不会**把 `single_turn_agent` 变成 `tool_agent`。`enable` 建议按语义一起开启，但不能替代路由。调用链见上一章和 [`AgentLoopWorker._run_agent_loop()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L675)。
+因此，仅设置 `multi_turn.enable=true` **不会**把 `single_turn_agent` 变成 `tool_agent`。`enable` 建议按语义一起开启，但不能替代路由。默认 fallback 见 [`AgentLoopWorker.generate_sequences()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L623-L626)，registry lookup 见 [`AgentLoopWorker._run_agent_loop()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L675-L693)。
 
 默认值还是 batch 字段级 fallback，而不是逐行 fallback：只有整个 batch 都没有 `agent_name` 这个 key 时才会填 `default_agent_loop`。若该列存在但某行是 `None`、空字符串或未知名字，那一行不会回退，而会在 registry lookup 时失败。
 
@@ -96,16 +96,19 @@ row["agent_name"] = "tool_agent"
 
 | 配置 | 当前 `ToolAgentLoop` 的实际行为 |
 |---|---|
-| `rollout.n` | 每个初始 prompt 的 rollout 数；V1 worker 内创建 n 个 sessions |
+| `rollout.n` | 训练时每个初始 prompt 的默认 rollout 数；validation 改用 `val_kwargs.n`，单个样本还可用内部字段 `__rollout_n__` 覆盖这两者 |
 | `max_assistant_turns` | 最多 inference 调用次数；应设为正整数；`null` 就是不设 turn cap |
 | `max_user_turns` | 最多 tool-response rounds；应设为正整数；不是自然语言 user 消息数；`null` 不设 cap |
-| `max_parallel_calls` | 同一 assistant turn 最多执行前 N 个调用 |
-| `max_tool_response_length` | tool response **Python 字符数**上限，不是 token 数 |
+| `max_parallel_calls` | 同一 assistant turn 最多执行前 N 个调用；只应设为正整数 |
+| `max_tool_response_length` | 成功执行返回文本的 **Python 字符数截断阈值**，不是 token 数或最终硬上限；只应设为正整数 |
+| `tool_response_truncate_side` | `left`、`right` 或 `middle`；当前实现未做枚举校验，任何其他值或拼写错误都会静默按 `middle` 处理 |
 | `format` | 选择 `ToolParser`，不会自动更换模型 chat template |
 
 当前 [`rollout.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L181) 中“`null` 默认 `max_length // 3`”的注释已经与实现漂移：代码用 truthiness 检查，`None` 就是不限制 turn 数，最终主要由 `response_length` 兜底。
 
 这两个 turn cap 当前没有范围校验：`0` 也是 falsy，实际等同“不设限制”；负数则会在第一次 generation 后命中 `turns >= cap`。实际配置只应使用正整数或 `null`。
+
+`max_parallel_calls` 和 `max_tool_response_length` 同样没有正数校验，但只能安全地使用正整数。前者直接进入 Python slice：`0` 会执行零个调用，负数会按负切片语义执行“除末尾若干个以外”的调用；后者若为 `0` 或负数，字符切片也会产生非预期结果。
 
 同一配置块里还有三个字段：
 
@@ -516,10 +519,10 @@ response_logprobs = [-0.2, -0.1, 0.0, 0.0, 0.0, -0.3, -0.05]
 
 这里必须区分两类接口：
 
-- learned reward model 可以使用完整 `input_ids = 初始 prompt || A1 || O || A2`；
+- 内置且未配置 `custom_reward_function` 的 discriminative RM（disrm）路径不会原样使用 rollout 的完整 `input_ids`。它从 `raw_prompt` 重建 chat，把 `responses = A1 || O || A2` decode 后作为**一个 assistant message**追加，再用 reward-model tokenizer 重新套 chat template；原始 assistant/tool role 边界不会作为结构化 messages 保留。配置自定义 reward function（genrm 也要求如此）时则直接进入 reward manager 的 `run_single()`，不会经过这一步。实现见 [`RewardLoopWorker._preprocess_reward_inputs()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_loop.py#L145-L155) 与 [输入重建逻辑](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_loop.py#L197-L229)；
 - 内置 rule/streaming `NaiveRewardManager` 传给 `compute_score()` 的 `solution_str` 只 decode `responses = A1 || O || A2`，不含初始 prompt。
 
-两者都能看到 interleaved assistant/tool response，而不是只看最后一个 assistant answer；但自定义 rule function 若还需要原始问题，应从 `extra_info` 或其他 dataset 字段读取，不能假定它已经包含在 `solution_str`。reward scalar 随后稀疏放到最后一个真实 response token；GRPO 等算法再按 prompt group 处理 advantage。
+两条路径都基于整段 response，而不是只看最后一个 assistant answer，但上述内置 disrm 路径会经过 decode/re-template。默认 rule manager 调用 `compute_score()` 时只传 `data_source`、`solution_str`、`ground_truth` 和 `extra_info`；自定义 rule function 若需要原始问题，应把它放进 `extra_info`，不能假定它已包含在 `solution_str`，也不能直接读取任意顶层 dataset 字段。若必须使用其他顶层字段，需要自定义 reward manager 显式转发。接口见 [`NaiveRewardManager.run_single()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_manager/naive.py#L34)。reward scalar 随后稀疏放到最后一个真实 response token；GRPO 等算法再按 prompt group 处理 advantage。
 
 ---
 
@@ -826,7 +829,7 @@ ToolResponse(
 2. image observation 需要有 image processor 的 VLM；纯文本 LLM 会报错；
 3. image 会加入后续 multimodal input；
 4. video 字段虽然存在，但当前 processing path 明确抛 `NotImplementedError`；
-5. text 会先按 `max_tool_response_length` 截断。
+5. 成功执行返回的 text 会经过 `max_tool_response_length` 截断；unknown tool、非法 JSON 和 create/execute 异常产生的 error observation 会在截断逻辑前直接返回，不受这个阈值限制。
 
 ### 截断是字符，不是 token
 
@@ -836,7 +839,7 @@ ToolResponse(
 len(tool_response_text)
 ```
 
-因此它计算 Python 字符数。中文、代码、JSON 在 tokenizer 中可能对应完全不同的 token 数。截断之后还会添加 `...(truncated)...` 标记，所以最终字符串长度也可能大于配置值。
+因此它计算 Python 字符数。中文、代码、JSON 在 tokenizer 中可能对应完全不同的 token 数。截断之后还会添加 `...(truncated)...` 标记，所以即使是成功结果，最终字符串长度也可能大于配置值；它不是字符硬上限。error observation 绕过截断、以及非法 `tool_response_truncate_side` 回落到 middle 的控制流见 [`ToolAgentLoop._call_tool()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L489-L540)。
 
 更可靠的长度工程是：
 

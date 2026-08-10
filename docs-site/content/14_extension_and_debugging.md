@@ -14,7 +14,7 @@ flowchart TD
     E -->|改变整个交互控制流| AL["AgentLoop"]
     E -->|否| R{"怎样评分？"}
     R -->|单样本打分函数| RF["Custom Reward Function"]
-    R -->|批处理/外部服务/新装配逻辑| RM["RewardManager"]
+    R -->|逐样本多阶段评分/外部服务/新装配逻辑| RM["RewardManager"]
     R -->|否| A{"怎样从 reward 得到学习信号？"}
     A -->|改变 advantage/return| ADV["Advantage Estimator"]
     A -->|改变 actor objective| LOSS["Policy Loss"]
@@ -73,7 +73,19 @@ VERL_USE_EXTERNAL_MODULES=my_project.verl_extensions \
 python3 -m verl.trainer.main_ppo ...
 ```
 
-入口见 [`verl/__init__.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/__init__.py)。外部包必须在 driver 和 Ray runtime 环境中都可 import；不要只在登录节点临时修改 `sys.path`。
+入口见 [`verl/__init__.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/__init__.py)。外部包必须在 driver 和 Ray runtime 环境中都可 import，而且注册模块必须在每个查询 registry 的进程中实际执行；不要只在登录节点临时修改 `sys.path`。
+
+如果 Ray 是预先或在集群外启动的，不要假定 driver shell 中的 `VERL_USE_EXTERNAL_MODULES` 会自动传播给 worker。自定义 policy loss 等 registry 会在 actor worker 内查询，应显式传入 Ray runtime env：
+
+```yaml
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        VERL_USE_EXTERNAL_MODULES: my_project.verl_extensions
+```
+
+也可以使用安装后自动发现的 plugin entry point，或在 worker 初始化路径中显式 import 注册模块；无论采用哪种方式，都要同时保证模块代码对 worker 可见。
 
 ### 规则四：先确认 V1/V0 边界
 
@@ -274,6 +286,8 @@ class MyRewardManager(RewardManagerBase):
         }
 ```
 
+同一个 batch 中，每条样本的 `reward_extra_info` 必须使用相同的 key 集；没有某个分量时也要显式填默认值，而不是省略 key。当前 [`RewardLoopManager.compute_rm_score()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_loop.py) 以第一条结果的 key 集为准，再逐条读取 `info[key]`：某条缺 key 会报错，第一条为空还会让后续样本独有的指标不进入输出。若不需要额外指标，所有样本统一返回空 dict。
+
 registry 方式还要选择这个名字，并保证包含装饰器的模块已经导入：
 
 ```yaml
@@ -455,6 +469,8 @@ class MyAgentLoop(AgentLoopBase):
         )
 ```
 
+输出必须逐位置对齐：`len(response_ids) == len(response_mask)`；`response_logprobs` 要么为 `None`，要么也必须与 `response_ids` 等长。自定义 loop 插入 environment/tool observation 时，该位置的 `response_mask` 应为 0，`response_logprobs` 也要放一个 `0.0` 占位，不能直接省略；否则 observation 后面的 assistant log-prob 会整体错位。内置 [`ToolAgentLoop`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py) 就同步追加这两个占位。
+
 这是简化结构；请求 ID、multimodal、长度限制、trace、preemption 等应参考 [`SingleTurnAgentLoop`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/single_turn_agent_loop.py)。
 
 ### 注册方式
@@ -548,6 +564,9 @@ algorithm:
 policy loss registry 同样在 [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py)。函数签名由 `PolicyLossFn` 明确：
 
 ```python
+from verl.trainer.ppo.core_algos import register_policy_loss
+
+
 @register_policy_loss("my_loss")
 def compute_my_policy_loss(
     old_log_prob,
@@ -610,20 +629,24 @@ for i, token_id in enumerate(response_ids):
         "i": i,
         "text": tokenizer.decode([int(token_id)]),
         "attention": int(response_attention_mask[i]),
-        "action": int(response_mask[i]),
+        "loss_mask": int(loss_mask[i]),
+        "response_mask": int(response_mask[i]),
         "reward": float(rm_scores[i]),
         "advantage": float(advantages[i]) if advantages is not None else None,
     })
 ```
 
+先记录审计发生在哪个阶段。V1 的 Agent Loop 刚写入 trajectory 时，会令 `loss_mask=response_mask`，两者都表示原始 assistant action，tool/environment observation 为 0。启用 rollout correction/rejection 后，trainer 会把被拒绝 assistant token 对应的 `response_mask` 改成 0 并写回，而原始 `loss_mask` 保持不变；因此此时 `response_mask` 是 loss 分子的有效训练 mask，`loss_mask` 是 correction 前的 action/全局 token normalization mask。没有 rejection 时二者仍相同。对应写入与 correction 接线见 [`AgentLoopWorkerTQ`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py) 和 [`rollout_corr_helper.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/rollout_corr_helper.py)。
+
 目标不是长期在训练中打印，而是验证：
 
 ```text
-padding          → attention=0, action=0
-assistant token  → attention=1, action=1
-tool observation → attention=1, action=0
-terminal reward  → 位于最后有效 response token（按所用 manager 契约）
-advantage/loss   → loss 只消费 mask 有效位置；原始 estimator 输出在 mask 外不一定为 0
+padding                    → attention=0, loss_mask=0, response_mask=0
+保留的 assistant token    → attention=1, loss_mask=1, response_mask=1
+tool observation           → attention=1, loss_mask=0, response_mask=0
+被 rejection 的 assistant → attention=1, loss_mask=1, response_mask=0（仅 rejection 后）
+terminal reward            → 位于最后有效 response token（按所用 manager 契约）
+advantage/loss             → 分子只消费 response_mask 有效位置；token normalization 还可能统计 loss_mask
 ```
 
 如果这里不对，loss 数值“看起来正常”也没有意义。

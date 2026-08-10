@@ -15,7 +15,7 @@
 
 开始前先纠正一个容易混淆的名字：
 
-> `trainer.v1.trainer_mode=sync` 描述的是**训练与生成的调度关系**，不表示 rollout 调用同步 API。当前 `RolloutConfig` 只接受 `rollout.mode=async`；显式设置 `rollout.mode=sync` 会报错，见 [`RolloutConfig.__post_init__()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L276-L290)。
+> `trainer.v1.trainer_mode=sync` 描述的是**训练与生成的调度关系**，不表示 rollout 调用同步 API。当前唯一受支持和推荐的值是 `rollout.mode=async`；显式设置 `rollout.mode=sync` 会在配置校验阶段报错。其他未知值在 [`RolloutConfig.__post_init__()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L276-L290) 阶段虽然只触发 `DeprecationWarning`，但之后构造 rollout 时仍会因为 registry 中不存在对应的 `(rollout_name, mode)` 组合而失败，见 [`get_rollout_class()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L88-L106)。因此这些未知值同样不可用。
 
 ---
 
@@ -260,15 +260,21 @@ rollout.n_gpus_per_node > 0
 rollout.checkpoint_engine.backend != naive
 ```
 
-如果启用 reward model，还必须让它使用独立 resource pool：
+如果启用 reward model，还必须让它使用独立 resource pool，并给这个 pool 配置正数规模；reward model 本身所需的模型路径和 rollout engine 也不能省略：
 
 ```yaml
 reward:
   reward_model:
+    enable: true
     enable_resource_pool: true
+    nnodes: 1
+    n_gpus_per_node: 8
+    model_path: /path/to/reward-model
+    rollout:
+      name: vllm
 ```
 
-原因是 standalone rollout 不会为了 colocated reward model 停下来释放 GPU。默认 rollout 却是 `nnodes: 0` 和 `checkpoint_engine.backend: naive`，见 [`rollout.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L4-L14) 与 [`checkpoint engine 默认值`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L271-L300)。所以只修改 `trainer_mode=separate_async` 一定不够。
+原因是 standalone rollout 不会为了 colocated reward model 停下来释放 GPU。未启用 reward model 时，应保持默认的 `enable: false` 和 `enable_resource_pool: false`；不能只把 `enable_resource_pool` 改成 `true`，因为 resource-pool 初始化会独立检查 `nnodes > 0` 和 `n_gpus_per_node > 0`，见 [`reward.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/reward/reward.yaml#L27-L40) 与 [`resource pool 校验`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L761-L770)。默认 rollout 则是 `nnodes: 0` 和 `checkpoint_engine.backend: naive`，见 [`rollout.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L4-L14) 与 [`checkpoint engine 默认值`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L271-L300)。所以只修改 `trainer_mode=separate_async` 一定不够。
 
 ---
 
@@ -321,9 +327,9 @@ max_global_steps  = 11
 - 原 inference engine request 对象；
 - 原 server 上的 KV cache；
 - 原采样 RNG 的精确状态；
-- 必须命中同一台 rollout server 的保证。
+- 跨 retry 必须命中同一台 rollout server 的硬保证。
 
-因此 partial rollout 是“把已有 token 当作新 prefix，重新 prefill 后继续”，不是原 request 的原地续跑。新段可以由不同 server、不同权重版本生成。
+因此 partial rollout 是“把已有 token 当作新 prefix，重新 prefill 后继续”，不是原 request 的原地续跑。Fully-async retry 会复用同一个逻辑 `request_id`，全局 load balancer 通常会把它 sticky 到同一台仍 active 的 server，见 [`GlobalRequestLoadBalancer`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L46-L111)。但 server 被移除、sticky cache entry 被淘汰或 cache 被清空后仍会重选，所以这是 best-effort affinity，不是 KV/RNG 状态恢复或硬保证；新段始终可能使用不同权重版本，在上述重选条件下也可能使用不同 server。
 
 ### 6.3 async sampler 仍不会训练半条 trajectory
 
@@ -427,15 +433,15 @@ age = K - S + 1
 ```text
 若任意 pending/running prompt 的 age >= threshold：
     即使已经有足够 finished groups，也暂不 sample
-    等这个老请求 terminal 后再训练它
+    等这个老请求进入 terminal 状态
 ```
 
-它是 dropless backpressure，不是把 terminal 旧样本过滤掉，见 [`_has_enough_samples()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L524-L539)。
+它只是针对 **staleness eviction** 的 dropless backpressure，不保证 terminal group 一定被训练。老请求若正常 `finished` 且没有被 DAPO filter 独立淘汰，会进入 oldest-first sampling；若变成 `failure`，async sampler 无论配置 `drop` 还是 `wait` 都会将它淘汰并补发。阻塞条件见 [`_has_enough_samples()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L524-L539)，failure/DAPO eviction 见 [`_terminal_eviction_reasons()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L514-L522)。
 
 | 策略 | 吞吐/稳定性取舍 | 风险 |
 |---|---|---|
 | `drop` | 不让慢请求卡住 trainer | 浪费已经做过的生成/工具工作，并改变有效数据分布 |
-| `wait` | 不丢老请求 | 一个极慢 tool/request 可对采样形成 backpressure |
+| `wait` | 不因 staleness 丢老请求；failure/DAPO filter 仍可淘汰 | 一个极慢 tool/request 可对采样形成 backpressure |
 
 默认 threshold 为 8、策略为 `drop`，见 [`ppo_trainer.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/ppo_trainer.yaml#L248-L257)。validation 不做这一套 eviction。
 
@@ -651,7 +657,7 @@ fsdp_config.json
 ### 11.4 保存与保留策略的现实边界
 
 - 默认 `trainer.save_freq=-1`，所以默认连最后一步也不会保存；外层条件要求 `save_freq > 0`，见 [`ppo_trainer.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/ppo_trainer.yaml#L169-L170) 和 [`fit()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L456-L461)。
-- `max_actor_ckpt_to_keep` / `max_critic_ckpt_to_keep` 管的是 role checkpoint 路径，不是整棵 `global_step_K/` 的完整垃圾回收；旧 `data.pt`、TQ snapshot 或空目录可能留下。
+- `max_actor_ckpt_to_keep` / `max_critic_ckpt_to_keep` 管的是 role checkpoint 路径，不是整棵 `global_step_K/` 的完整垃圾回收；旧 `data.pt`、TQ snapshot 或空目录可能留下。它们也不是跨重启的全局保留上限：checkpoint manager 的已保存路径列表从空开始，只登记当前进程之后的新 save，不会扫描或登记前一进程已有的 role 目录，见 [`CheckpointManager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/checkpoint/checkpoint_manager.py#L40-L59) 与 [`retention bookkeeping`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/checkpoint/checkpoint_manager.py#L166-L194)。
 - `auto` resume 依赖本地 tracker，不会扫描最大的 `global_step_*` 目录，见 [`find_latest_ckpt_path()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/checkpoint/checkpoint_manager.py#L219-L256)。
 - `default_hdfs_dir` 只从顶层传给 actor/critic；`data.pt`、TQ snapshot 和 root tracker 仍只写本地。具体 backend 的远程支持也不同；例如 FSDP manager 明确把 `hdfs_path` 视为未使用参数，见 [`FSDP save docstring`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/checkpoint/fsdp_checkpoint_manager.py#L272-L289)。
 - `async_save` 当前只由 Megatron 实现，见 [`CheckpointConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/config.py#L33-L49)。不要在其他 backend 上仅仅打开该 flag：顶层 trainer 会跳过 tracker 写入，而 backend 未必会代写。
@@ -719,7 +725,7 @@ tq.save_checkpoint(
 4. 把 prompt 的 `global_steps` 更新为恢复后的 K+1；
 5. 把状态重置为 `pending`；
 6. 重新交给 AgentLoop，从**完整 prompt**开始生成；
-7. 已经 terminal 的 finished groups 和完整 trajectories 保留原样。
+7. 已经 terminal 的 `finished` / `failure` groups 和已有 trajectories 都由 reissue 原样保留；随后 async sampler 会让 finished group 正常参与采样，并淘汰、补发 failure group。
 
 实现见 [`_reissue_inflight_prompts()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L847-L883)，测试覆盖 pending/running 重投与 finished 保留，见 [`test_reissue_inflight_on_cpu.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py#L236-L309)。
 
@@ -793,7 +799,7 @@ trainer:
 
 actor_rollout_ref:
   rollout:
-    mode: async              # 当前 rollout API 只支持 async
+    mode: async              # 唯一受支持/推荐值；sync 会报错
   actor:
     checkpoint:
       save_contents: [model, optimizer, extra]
@@ -851,8 +857,11 @@ actor_rollout_ref:
 
 reward:
   reward_model:
-    enable_resource_pool: true  # 启用 reward model 时需要
+    enable: false
+    enable_resource_pool: false
 ```
+
+上面的最小示例不启用 reward model。若要启用，请把 `reward.reward_model` 块替换为 5.2 节中的完整独立 resource-pool 配置，并按实际环境填写 `model_path`、engine、节点数和每节点 GPU 数；不要单独设置 `enable_resource_pool: true`。
 
 切换前至少核对：
 

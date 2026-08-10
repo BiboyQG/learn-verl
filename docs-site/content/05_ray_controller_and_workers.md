@@ -159,7 +159,7 @@ flowchart LR
     S --> PG1 --> N1
 ```
 
-这里的 A、B 由 Ray 调度器选择；列表本身不是物理 node ID。placement group 就绪后，verl 按节点 IP 排序，使跨重启的 rank 顺序更稳定，相关实现见 [`sort_placement_group_by_node_ip()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L70)。
+这里的 A、B 由 Ray 调度器选择；列表本身不是物理 node ID，而且 A、B **不保证是不同物理节点**。`STRICT_PACK` 只约束单个 placement group 内的 bundles 共处一台节点，并不在两个 placement groups 之间建立 anti-affinity；容量允许时二者可以落在同一节点。placement group 就绪后，verl 按节点 IP 排序，使跨重启的 rank 顺序更稳定，相关实现见 [`sort_placement_group_by_node_ip()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L70)。
 
 ### 3.3 `ResourcePoolManager` 管理“角色 → 池”
 
@@ -579,7 +579,7 @@ flowchart LR
 1. 首次查询每个 global rank 的 DP rank；
 2. batch 只切成 `dp_size` 份；
 3. 每个 shard 通过 `ray.put()` 只放入 object store 一次；
-4. 属于同一 DP replica 的 TP/PP ranks 获得同一个 ObjectRef；
+4. 属于同一 DP replica 的 TP/PP ranks 以同一个 `ObjectRef` 作为 RPC 依赖，共享同一份 object-store shard；Ray 在调用 worker 方法前解析顶层引用，因此方法实参是 shard 对象本身；
 5. 所有 ranks 都参与模型并行计算；
 6. collect 只保留 `is_collect=True` 的 model-parallel 输出源；
 7. 将每个 DP replica 的输出沿 batch 维拼接。
@@ -624,13 +624,17 @@ mapping[Role]             -> resource pool name
 
 ### 8.2 `WorkerDict` 才实现“多个逻辑角色，同一个 Ray actor 进程”
 
-actor 与 critic 默认都映射到 `global_pool`。trainer 会先按 pool 把 classes 聚合：
+actor 映射到 `global_pool`；当 `need_critic(config)` 为真时，critic 也映射到这个 pool。actor 的 key 并不固定：[只有需要独立 reference policy 时](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L740-L748)才是 `actor_rollout_ref`；否则是 `actor_rollout`。本快照默认 reward-side KL 与 actor KL loss 都关闭，所以默认 key 是 `actor_rollout`。trainer 会先按 pool 把 classes 聚合：
 
 ```python
-resource_pool_to_cls[global_pool] = {
-    "actor_rollout_ref": RayClassWithInitArgs(...),
-    "critic": RayClassWithInitArgs(...),
-}
+actor_role = str(
+    Role.ActorRolloutRef
+    if need_reference_policy(config) and not ref_in_actor
+    else Role.ActorRollout
+)
+resource_pool_to_cls[global_pool] = {actor_role: RayClassWithInitArgs(...)}
+if need_critic(config):
+    resource_pool_to_cls[global_pool]["critic"] = RayClassWithInitArgs(...)
 ```
 
 然后调用：
@@ -647,9 +651,9 @@ all_wg.update(wg_dict.spawn(class_dict.keys()))
 
 ```text
 WorkerDict Ray actor process / global rank i
-├── worker_dict["actor_rollout_ref"]
+├── worker_dict[actor_role]  # "actor_rollout" 或 "actor_rollout_ref"
 │   └── ActorRolloutRefWorker
-└── worker_dict["critic"]
+└── worker_dict["critic"]         # 仅当 need_critic(config)
     └── TrainingWorker
 ```
 
@@ -664,20 +668,22 @@ WorkerDict Ray actor process / global rank i
 工厂将内部注册方法加上 role 前缀，例如：
 
 ```text
-actor_rollout_ref_init_model
-critic_reset
+actor_rollout_init_model       # 无独立 ref 时
+actor_rollout_ref_init_model   # 有独立 ref 时
+critic_reset                       # 仅当 need_critic(config)
 ```
 
 绑定逻辑见 [`ray/base.py:919-965`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L919)。
 
-随后 [`RayWorkerGroup.spawn()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L718) 创建两个 controller 侧视图：
+随后 [`RayWorkerGroup.spawn()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L718) 一定创建 actor 的 controller 侧视图，并仅在需要 critic 时创建 critic 视图：
 
 ```python
-actor_rollout_wg = all_wg["actor_rollout_ref"]
-critic_wg = all_wg["critic"]
+actor_rollout_wg = all_wg[actor_role]
+if need_critic(config):
+    critic_wg = all_wg["critic"]
 ```
 
-它们看起来是两个 group，底层却复用同一批 actor handles。`spawn()` 没有创建新进程，只是给同一批 handles 重新绑定不同的方法名，见 [`ray/base.py:730-751`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L730)。
+critic 存在时，这两个视图看起来是两个 group，底层却复用同一批 actor handles。`spawn()` 没有创建新进程，只是给同一批 handles 重新绑定不同的方法名，见 [`ray/base.py:730-751`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L730)。
 
 > 源码现状：`create_colocated_worker_cls()` 已标记 deprecated，新版 `FusedWorker` 工厂位于同文件 [`ray/base.py:1035-1125`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L1035)；但当前默认 V1 trainer 仍实际使用旧 `WorkerDict` 路径。因此理解当前运行时，应以 `WorkerDict` 为准。
 
@@ -862,22 +868,25 @@ sequenceDiagram
     participant TQ as "TransferQueue"
 
     T->>WG: compute_log_prob(KVBatchMeta)
-    opt 第一次调用 actor mesh
+    opt 第一次 dispatch actor mesh
         WG->>R: _query_dispatch_info("actor")
         R-->>WG: 每个 global rank 的 DP rank
-        WG->>R: _query_collect_info("actor")
-        R-->>WG: 每个 rank 是否输出源
-        WG->>MAP: 缓存 mapping + collect mask
+        WG->>MAP: 缓存 DP mapping
     end
     WG->>WG: 按 DP size 切 metadata 并映射到 ranks
     par 对所有 global ranks 提交 RPC
-        WG->>R: actor_rollout_ref_compute_log_prob.remote(shard)
+        WG->>R: role-prefixed compute_log_prob.remote(shard)
     end
     R->>AR: compute_log_prob(local shard)
     AR->>E: infer_batch(local TensorDict)
     E-->>AR: model-parallel 输出源返回 log_probs
     AR->>TQ: collect rank 写回输出字段
     R-->>WG: metadata / empty result
+    opt 第一次 collect actor mesh
+        WG->>R: _query_collect_info("actor")
+        R-->>WG: 每个 rank 是否输出源
+        WG->>MAP: 缓存 collect mask
+    end
     WG->>WG: 按 collect mask 只保留 DP 输出源
     WG-->>T: 合并后的逻辑 metadata
 ```
@@ -965,14 +974,19 @@ sequenceDiagram
     loop 每个 global rank
         WG->>W: ActorClass.options(bundle, num_gpus).remote()
     end
-    W->>TD: initialize_global_process_group_ray()
     C->>WG: spawn(role names)
-    WG-->>C: actor_wg / critic_wg views，共用 handles
-    C->>WG: critic_wg.reset()
+    WG-->>C: actor_wg view
+    opt need_critic(config)
+        WG-->>C: critic_wg view，与 actor_wg 共用 handles
+        Note over W,TD: critic inner worker 可在 Ray actor constructor 中初始化 process group
+        C->>WG: critic_wg.reset()
+    end
     C->>WG: actor_wg.init_model()
     C->>C: 启动 reward / rollout managers
     C->>WG: compute / update RPCs
 ```
+
+图中的 `spawn(role names)` 只是 controller 侧复用并重绑已经拿到的 actor handles，不是 constructor/process-group 初始化屏障。有 critic 时，Ray actor constructor 实例化 critic `TrainingWorker` 并建立 process group；无 critic 时，要到随后 `actor_wg.init_model()` 创建 actor 的内部 `TrainingWorker` 才建立。constructor 可以与 `spawn()` 并行，随后第一次真正的 worker RPC 才会等待 constructor 完成。
 
 对应关键源码索引：
 

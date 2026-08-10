@@ -2,7 +2,7 @@
 
 ## 2.1 一句话定义
 
-verl 是一个面向 LLM 强化学习后训练的 **混合控制器（hybrid-controller）框架**：高层由 single controller 以 MPMD 方式编排 actor、rollout、critic、reward 等不同程序；进入某个模型角色内部后，再由各 rank/process group 以 SPMD 式分布式后端共同完成计算。
+verl 是一个面向 LLM 强化学习后训练的 **混合控制器（hybrid-controller）框架**：高层由 single controller 以 MPMD 方式编排 actor、rollout、critic、reward 等不同程序；训练 Model Engine 内部再由各 rank/process group 以 SPMD 方式共同计算。rollout 则默认运行在 server mode，底层 executor 可以分布式执行，但不应把整个 rollout 角色概括成 SPMD worker。
 
 角色共置和后端替换是这套控制结构带来的重要能力：actor、rollout、reference 可以共置于相同 worker/GPU；训练可用 FSDP/Megatron 等，rollout 可用 vLLM/SGLang/TensorRT-LLM 等。但它们不是 “hybrid-controller” 一词本身的完整定义。
 
@@ -27,13 +27,16 @@ flowchart TB
     end
 
     subgraph D["Data Plane：数据平面"]
-        DS["Dataset / DataLoader"] --> ALM["AgentLoopManagerTQ"]
+        DS["Dataset / DataLoader"] --> TRAINER
+        TRAINER -->|"register pending prompt"| TQ["TransferQueue"]
+        TRAINER --> ALM["AgentLoopManagerTQ"]
         ALM --> ALW["AgentLoopWorkerTQ"]
-        RS --> ALW
-        ALW --> TQ["TransferQueue"]
+        ALW <--> RS
+        ALW -->|"trajectory"| TQ
         RW -.->|"reward result"| ALW
         TQ <--> WG
-        META["KVBatchMeta"] <--> WG
+        META["KVBatchMeta"] -->|"dispatch as BatchMeta"| WG
+        WG -->|"collect metadata"| META
     end
 
     subgraph A["Algorithm Plane：算法平面"]
@@ -43,7 +46,7 @@ flowchart TB
     end
 
     TRAINER --> ADV
-    TE --> OBJ
+    OBJ --> TE
     TQ --> RSHAPE
 ```
 
@@ -136,14 +139,14 @@ flowchart LR
 python3 -m verl.trainer.main_ppo
 └── main(config)
     ├── validate_config(config)
-    └── run_ppo(config)
+    └── run_ppo(config, TaskRunnerV1)
         ├── ray.init(...)
         └── TaskRunnerV1.remote().run(config)
-            ├── config.transfer_queue.enable = true
-            ├── choose trainer mode + tq.init(...)
+            ├── trainer_cls = get_trainer_cls(trainer_mode)
+            ├── enable / resolve config + tq.init(...)
             ├── trainer.init()
             ├── AgentLoopManagerTQ.create(...)
-            └── trainer.fit()
+            └── trainer.fit(agent_loop_manager)
 ```
 
 对应入口见 [`verl/trainer/main_ppo.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/main_ppo.py)。
@@ -160,11 +163,12 @@ Trainer 位于 controller 一侧，它的代码像：
 
 ```python
 # 等价伪代码
-self.agent_loop_manager.generate_sequences(prompts)  # fire-and-forget
+self._add_batch_to_generate()  # fetch prompt，先注册 TQ pending tag，再 fire-and-forget
 batch_meta, sample_metrics = self.replay_buffer.sample(...)
 
 if reward_model_is_colocated:
     batch_meta = self._compute_reward_colocate(batch_meta, metrics)
+batch_meta = self._balance_batch(batch_meta, metrics)
 batch_meta = self._compute_old_log_prob(batch_meta, metrics)
 if self.use_reference_policy:
     batch_meta = self._compute_ref_log_prob(batch_meta, metrics)
@@ -181,7 +185,7 @@ reward 也可能已由并行 Reward Loop 在 Agent Loop 后处理阶段写入；
 
 ### Worker
 
-verl 中 “worker” 这个词有两层。默认 V1 的 Ray 远程进程边界是外层 `WorkerDict` actor；它内部再组合 `ActorRolloutRefWorker`、`TrainingWorker` 等普通本地对象。后者仍负责模型计算，但不能把每个 inner worker 都想成独立 Ray process。
+verl 中 “worker” 这个词有两层。在默认 V1 的 **模型训练 worker group** 中，Ray 远程进程边界是外层 `WorkerDict` actor；它内部再组合 `ActorRolloutRefWorker`、`TrainingWorker` 等普通本地对象。后者仍负责模型计算，但不能把每个 inner worker 都想成独立 Ray process。这个限定不适用于全部子系统：[`AgentLoopWorkerTQ` 本身就是 Ray actor](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L52-L59)，Reward Loop workers 和 rollout replicas 也由各自 manager 独立创建。
 
 这一组 worker 对象共同负责：
 
@@ -213,16 +217,18 @@ trainer → worker group → worker method → engine API → PyTorch/backend ke
 ```mermaid
 sequenceDiagram
     participant DL as DataLoader
+    participant TR as Trainer
     participant AL as AgentLoopManagerTQ
     participant AW as AgentLoopWorkerTQ
     participant RS as Rollout Server
     participant TQ as TransferQueue
     participant RB as ReplayBuffer
-    participant TR as Trainer
     participant WG as WorkerGroup
     participant WK as Worker
 
-    DL->>AL: raw_prompt + metadata
+    TR->>DL: next batch + assign uid
+    TR->>TQ: register prompt keys / pending tags
+    TR->>AL: TensorDict(raw_prompt + metadata)
     AL->>AW: dispatch prompt chunks
     AW-->>AL: background tasks scheduled
     AL-->>TR: 提交完成（不返回 trajectory batch）
@@ -235,17 +241,26 @@ sequenceDiagram
     TR->>WG: worker-group method(KVBatchMeta)
     WG->>WG: dispatch/chunk：KVBatchMeta → BatchMeta
     WG->>WK: Ray RPC(BatchMeta shard)
-    WK->>TQ: 按 keys 取需要的 fields
-    WK->>WK: compute
-    WK->>TQ: 写入 log_probs / values / ...
-    WK-->>WG: BatchMeta shard
-    WG->>WG: collect/concat：BatchMeta → KVBatchMeta
-    WG-->>TR: 更新后的 KVBatchMeta
+    alt blocking 字段计算
+        WK->>TQ: 按 BatchMeta 索引取需要的 fields
+        WK->>WK: compute
+        WK->>TQ: 写入 log_probs / ...
+        WK-->>WG: BatchMeta shard
+        WG->>WG: collect/concat：BatchMeta → KVBatchMeta
+        WG-->>TR: 更新后的 KVBatchMeta
+    else critic infer_batch（blocking=False）
+        WG-->>TR: 立即返回 DataProtoFuture（不等待计算）
+        WK->>TQ: 按 BatchMeta 索引取 fields
+        WK->>WK: compute values
+        WK->>TQ: 写入 values
+        TR->>TR: 等待 futures 完成
+        TR->>TQ: 读取/对齐 values，保留原 KVBatchMeta
+    end
 ```
 
 `KVBatchMeta` 更像“这一批数据的句柄和标签”，不是完整 trajectory tensor。
 
-对于“产生非空 batch `TensorDict` 且需要 collect”的字段计算型 worker 方法，桥接逻辑会：
+对于“产生非空 batch `TensorDict` 且需要 collect”的 blocking 字段计算型 worker 方法，桥接逻辑会：
 
 1. 根据 metadata 从 TransferQueue 取字段；
 2. 在 worker 内构造计算所需的 TensorDict；
@@ -253,7 +268,7 @@ sequenceDiagram
 4. 把输出字段写回 TransferQueue；
 5. 把较小的 metadata 返回 controller。
 
-actor/critic update 这类只返回标量 metrics 的调用可以直接回到 controller，并不会为了统一形式而把 metrics 写成 TQ 列。上面的 bridge 过程解释了为什么只看 trainer 里的变量，可能看不到传统意义上的大 batch 内容。
+actor/critic update 这类只返回标量 metrics 的调用可以直接回到 controller，并不会为了统一形式而把 metrics 写成 TQ 列。critic 的 `infer_batch` 又是一个单独的 non-blocking 分支：controller [等待 `DataProtoFuture` 所代表的写入完成，再处理 TQ 中的 `values`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1566-L1586)，而不执行图中 blocking collect/concat。上面的几条路径解释了为什么只看 trainer 里的变量，可能看不到传统意义上的大 batch 内容。
 
 ## 2.8 DataProto 在 V1 中仍然存在，但角色变了
 
@@ -270,7 +285,7 @@ DataProto
 
 但需要区分：
 
-- **V0**：DataProto 广泛作为 controller 与 worker 之间的数据总线；
+- **V0**：controller 主 batch 与 Agent Loop 边界以 `DataProto` 为主；[进入统一 training-engine RPC 前会再转换成 padding-free `TensorDict`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/ray_trainer.py#L1227-L1261)；
 - **V1**：TransferQueue/KVBatchMeta 是主干；在需要现有 reward/advantage 算法时，会把 ragged 数据局部 pad 并复用 DataProto/算法函数。
 
 因此文档中看到 DataProto 时，要问：这是持久的主数据路径，还是某个局部计算接口的适配层？
@@ -312,8 +327,10 @@ flowchart TD
     V --> ADV["Reward + Advantage / Return"]
     ADV --> CU{"启用 critic?"}
     CU -->|是| CUPDATE["Update critic"]
-    CU -->|否| AUPDATE
-    CUPDATE --> AUPDATE["Update actor"]
+    CU -->|否| WARM{"global_steps >= critic_warmup?"}
+    CUPDATE --> WARM
+    WARM -->|是| AUPDATE["Update actor"]
+    WARM -->|否| END["结束本次 local update"]
 ```
 
 这个顺序有几层含义：

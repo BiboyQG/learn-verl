@@ -98,18 +98,20 @@ actor 表示当前策略 $\pi_\theta$。它承担两种训练侧计算：
 >
 > **符号说明：** `π`（读作 pi）表示策略，也就是模型的概率分布规则；下标 `θ`（读作 theta）表示 actor 的整组可训练参数。下标表示“这套策略由这些参数决定”，不是相乘。
 
-- forward-only：重算 trajectory 中 token 的 `old_log_probs`、entropy；
+- forward-only：默认 decoupled 路径会重算 trajectory 中 token 的 `old_log_probs` 和 entropy；`bypass_mode=True` 时则直接复用 `rollout_log_probs`，跳过这次 actor scoring；
 - train：根据 advantage 和 PPO/GRPO loss 做 backward、更新 $\theta$。
 
 > **公式含义（更新参数）：** 这里的单个符号指 optimizer 要改变 actor 的参数，使策略更符合当前 loss 给出的优化方向。
 >
 > **符号说明：** `θ` 仍是上面那组 actor 参数的统称，不是某一个标量；它通常包含模型中许多权重张量。
 
+当前默认是 `bypass_mode=false`，因此会走上述重算分支；但这不是所有配置的必经步骤。两个分支的真实控制流见 [`trainer_base.py:1479-1516`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1479-L1516)，默认值见 [`rollout_correction.yaml:19-20`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/algorithm/rollout_correction.yaml#L19-L20)。
+
 在当前统一 engine 路径里，actor 的 `TrainingWorkerConfig.model_type` 是 `language_model`。外层 [`ActorRolloutRefWorker.init_model`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L585-L641) 创建内部 `TrainingWorker`，安装 PPO loss，然后初始化具体 model engine。
 
 ### 2.2 Reference policy：冻结的比较基准
 
-reference policy 通常表示 $\pi_{ref}$，用于 KL reward 或 KL loss。它仍然是带 LM head 的 `language_model`，不是 `value_model`；区别在于它只做 forward，不需要 optimizer update。
+reference policy 通常表示 $\pi_{\mathrm{ref}}$，用于 KL reward 或 KL loss。它仍然是带 LM head 的 `language_model`，不是 `value_model`；区别在于它只做 forward，不需要 optimizer update。
 
 > **公式含义：** 这个公式表示“作为比较基准的那套策略概率分布”，训练时用它衡量 actor 偏离基准的程度。
 >
@@ -169,7 +171,7 @@ self.engine = EngineRegistry.new(
 )
 ```
 
-对应源码是 [`engine_workers.py:83-142`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L83-L142)。注意 `EngineRegistry.new()` 只实例化对象；第一次 `reset()` 才调用 `engine.initialize()` 建立 model、optimizer 和 scheduler，见 [`engine_workers.py:172-178`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L172-L178)。
+对应源码是 [`engine_workers.py:83-142`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L83-L142)。`EngineRegistry.new()` 会立即执行具体 backend 的 constructor；FSDP、Megatron、VeOmni 和 Automodel 主要把 model/optimizer 构建留到 `reset()` 调用的 `engine.initialize()`，见 [`engine_workers.py:172-178`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L172-L178)。这不是全后端保证：TorchTitan constructor 已创建 `Trainer`，其 `initialize()` 再取出 model/optimizer/scheduler 容器并加载初始权重，见 [`torchtitan/transformer_impl.py:106-193`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/torchtitan/transformer_impl.py#L106-L193) 与 [`torchtitan/transformer_impl.py:248-266`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/torchtitan/transformer_impl.py#L248-L266)。因此不要把 `new()` 当成对所有 backend 都零成本的纯配置步骤。
 
 ### 3.1 两条核心调用链
 
@@ -283,7 +285,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
     ...
 ```
 
-选择时先尝试 `(device, vendor)`，再回退到普通 `device`；设备与 vendor 还可由 `VERL_ENGINE_DEVICE`、`VERL_ENGINE_VENDOR` 覆盖，见 [`get_engine_cls`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/base.py#L396-L427)。当前本章讨论的五类内置注册都没有指定 vendor，因此末级 key 是 `cuda` 或 `npu`。
+选择时先尝试 `(device, vendor)`，再回退到普通 `device`；若设备是 `cuda`、检测到的 vendor 又不是 `nvidia`，前两项都未命中时还会最后尝试 `("cuda", "nvidia")`。设备与 vendor 可由 `VERL_ENGINE_DEVICE`、`VERL_ENGINE_VENDOR` 覆盖，见 [`get_engine_cls`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/base.py#L396-L427)。当前本章讨论的六类内置注册都没有指定 vendor，因此它们直接使用 `cuda` 或 `npu` key。
 
 ### 5.2 注册在 import 时发生
 
@@ -322,14 +324,15 @@ from verl.workers.engine.torchtitan import TorchTitanEngineWithLMHead
 
 ---
 
-## 6. 五类后端的当前真实注册边界
+## 6. 六类后端的当前真实注册边界
 
 下面的表以当前源码中的 `@EngineRegistry.register(...)` 为准，而不是根据 YAML 文件名推断。
 
 | backend / `strategy` | `language_model` | `value_model` | 注册设备 | 当前训练并行边界 |
 |---|---:|---:|---|---|
 | `fsdp` / `fsdp2` | 是 | 是 | CUDA、NPU | FSDP1/2、HSDP、Ulysses SP；无通用 TP/PP 配置 |
-| `megatron` | 是 | 是 | 原生类默认 CUDA | DP、TP、PP/virtual PP、CP、EP |
+| `megatron` | 是 | 是 | 原生类默认 CUDA；MindSpeed 另注册 NPU aliases | DP、TP、PP/virtual PP、CP、EP |
+| `mindspeed_megatron` | 是 | **否** | NPU | 继承 Megatron 调度并应用 MindSpeed patches；DP、TP、PP/virtual PP、CP、EP |
 | `veomni` | 是 | 是 | CUDA、NPU | FSDP2/HSDP、Ulysses SP、EP |
 | `torchtitan` | 是 | **否** | CUDA、NPU | FSDP2/HSDP、TP、CP、EP；PP 字段存在但当前 forward 明确拒绝 |
 | `automodel` | 是 | **否** | CUDA | 内层可选 FSDP2/Megatron-FSDP/DDP，支持 TP/CP/EP；当前 `pp_size` 必须为 1 |
@@ -338,6 +341,7 @@ from verl.workers.engine.torchtitan import TorchTitanEngineWithLMHead
 
 - FSDP LM/value：[`FSDPEngineWithLMHead`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L1115-L1116)、[`FSDPEngineWithValueHead`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L1562-L1568)；
 - Megatron LM/value：[`MegatronEngineWithLMHead`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L969-L970)、[`MegatronEngineWithValueHead`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L1288-L1318)；
+- MindSpeed：`backend="megatron"` 的 NPU LM/value aliases 见 [`mindspeed/transformer_impl.py:61-95`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/mindspeed/transformer_impl.py#L61-L95)，独立 `backend="mindspeed_megatron"` 的 NPU LM 注册见 [`mindspeed/transformer_impl.py:116-129`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/mindspeed/transformer_impl.py#L116-L129)；
 - VeOmni LM/value：[`VeOmniEngineWithLMHead`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/veomni/transformer_impl.py#L865-L870)、[`VeOmniEngineWithValueHead`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/veomni/transformer_impl.py#L1069-L1075)；
 - TorchTitan LM：[`TorchTitanEngineWithLMHead`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/torchtitan/transformer_impl.py#L598-L600)；
 - Automodel LM：[`AutomodelEngineWithLMHead`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/automodel/transformer_impl.py#L473-L475)。
@@ -367,19 +371,28 @@ context_parallel_size
 expert_model_parallel_size
 ```
 
-这些值会传入 Megatron 的 `initialize_model_parallel`，见 [`megatron/transformer_impl.py:152-179`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L152-L179)。它也是本章五类后端中，当前源码明确把 micro-batch 交给成熟 pipeline schedule 的实现，见 [`megatron/transformer_impl.py:725-790`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L725-L790)。
+这些值会传入 Megatron 的 `initialize_model_parallel`，见 [`megatron/transformer_impl.py:152-179`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L152-L179)。它及继承该实现的 MindSpeed 路径，是本章六类后端中当前明确把 micro-batch 交给成熟 pipeline schedule 的路径，见 [`megatron/transformer_impl.py:725-790`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L725-L790)。
 
 Megatron 的代价是模型必须能通过当前 Bridge/Megatron provider 建模和转换权重；并行维度越多，checkpoint、权重导出和通信拓扑也越复杂。它更适合模型已经超出单纯 FSDP 扩展范围、确实需要 TP/PP/CP/EP 的场景。
 
 设备还有一个细节：原生 Megatron decorator 未传 `device`，默认是 CUDA；NPU 上 `backend="megatron"` 的 key 由 MindSpeed 类另外注册，见 [`mindspeed/transformer_impl.py:61-95`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/mindspeed/transformer_impl.py#L61-L95)。这不是“原生 `MegatronEngine` 自动支持 NPU”。
 
-### 6.3 VeOmni
+### 6.3 MindSpeed：两种 registry key 不要混在一起
+
+MindSpeed 模块当前同时提供两种 NPU 路由：
+
+- `backend="megatron"` 下同时有 `language_model` 和 `value_model` aliases。这是上节所说的“Megatron key 在 NPU 上由 MindSpeed 实现”；
+- 独立 `backend="mindspeed_megatron"` 只有 NPU `language_model` 注册，没有同 key 的 `value_model`。`model_engine=mindspeed` 会组合出这条路径，见 [`model_engine/mindspeed.yaml:1-2`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/model_engine/mindspeed.yaml#L1-L2) 与 [`engine/mindspeed.yaml:1-5`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/engine/mindspeed.yaml#L1-L5)。
+
+因此，不能因为仓库里有 `mindspeed_critic.yaml` 就推断独立 `mindspeed_megatron` key 能训练 critic；当前 unified critic 只能走上面 `backend="megatron"` 的 NPU value alias。同样，[`MindSpeedEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L649-L670) 虽然允许 `mindspeed_fsdp` 字符串，当前 `EngineRegistry` 没有对应 decorator；可选值通过 dataclass 校验仍不等于 engine 已注册。
+
+### 6.4 VeOmni
 
 [`VeOmniEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L296-L445) 聚焦 FSDP2、Ulysses SP 和 expert parallel。实现中固定 `data_parallel_mode="fsdp2"`，并从 `world_size / ulysses_parallel_size` 推导 DP，再拆 replicate/shard，见 [`veomni/transformer_impl.py:142-173`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/veomni/transformer_impl.py#L142-L173)。
 
 它同时注册 LM head 和 value head，因此 actor/ref/critic 的统一路径都可选。仓库当前也有大型 MoE、VL 的 VeOmni 示例；不过端到端可用性仍取决于 VeOmni 自身的模型 registry、kernel 与硬件依赖，不能由 registry 表单独保证。
 
-### 6.4 TorchTitan
+### 6.5 TorchTitan
 
 [`TorchtitanEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L449-L524) 暴露 DP shard/replicate、TP、PP、CP 和 EP degree，并把这些值传给 TorchTitan `ParallelismConfig`，见 [`torchtitan/transformer_impl.py:138-147`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/torchtitan/transformer_impl.py#L138-L147)。
 
@@ -387,7 +400,7 @@ Megatron 的代价是模型必须能通过当前 Bridge/Megatron provider 建模
 
 另外，TorchTitan 只注册了 `language_model`，没有 `value_model`。仓库虽然仍有 [`TorchTitanCriticConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/critic.py#L237-L255) 与 YAML，但统一 critic 路径会因 registry 缺少 `(value_model, torchtitan, ...)` 而失败。当前端到端示例使用不需要 critic 的 GRPO；依赖还要求匹配的 PyTorch/TorchTitan nightly，详见仓库的 [`torchtitan_workers.rst`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/docs/workers/torchtitan_workers.rst#L16-L36)。
 
-### 6.5 Automodel
+### 6.6 Automodel
 
 [`AutomodelEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L528-L646) 有两层 strategy：
 
@@ -400,7 +413,7 @@ Megatron 的代价是模型必须能通过当前 Bridge/Megatron provider 建模
 
 Automodel 当前只有 CUDA `language_model` 注册，没有 value engine。仓库中现成示例集中在 SFT，见 [`automodel_workers.rst`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/docs/workers/automodel_workers.rst#L36-L65)；把它用于 RL actor 前，应先验证自己的配置组合、online weight export 与 rollout backend，而不要根据通用 `TrainingWorker` 接口推断整条 PPO 配置已经覆盖。
 
-### 6.6 一个反直觉但重要的结论
+### 6.7 一个反直觉但重要的结论
 
 存在下面任意一项，都不足以证明后端能力已经可用：
 
@@ -458,7 +471,7 @@ stage 1: layers 16..31 + output head
 
 同一个 micro-batch 先过 stage 0，再把 activation 发到 stage 1；backward 反向流回。为了减少 pipeline bubble，需要把 local mini-batch 拆成足够多 micro-batch 并调度交错执行。
 
-因此 PP rank 也不能各自拿不同样本。当前五类后端里，要使用真正可执行的通用 PP，主要应看 Megatron；TorchTitan 的字段已暴露但当前 forward 拒绝，Automodel 当前强制 PP=1。
+因此 PP rank 也不能各自拿不同样本。当前六类后端里，真正可执行的通用 PP 由 Megatron 实现，并由继承该实现的 MindSpeed 路径复用；TorchTitan 的字段已暴露但当前 forward 拒绝，Automodel 当前强制 PP=1。
 
 ### 7.4 SP/CP 与 EP 为什么也会出现
 
@@ -516,7 +529,7 @@ CP rank == 0
   │ TrainingWorker 按 PPO mini-batch 与 epoch 迭代
   ▼
 一次 optimizer step 的 local mini-batch
-  │ engine 按行数或 token budget 切分
+  │ engine 按固定行数，或按 token 目标值与 workload 启发式切分
   ▼
 若干 forward/backward micro-batch
   │ 梯度累积
@@ -556,29 +569,39 @@ mini_batch_size_per_gpu = mini_batch_size // engine.get_data_parallel_size()
 公共 [`prepare_micro_batches`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/utils.py#L83-L121) 支持两种方式：
 
 - 固定模式：按 `micro_batch_size_per_gpu` 切行；
-- 动态模式：根据实际 token 数和 attention workload 重排，以 token budget 控制峰值。
+- 动态模式：先由 token 目标值推导 micro-batch 数量，再按 attention workload 重排样本。该目标是拆分启发式，不是每个 micro-batch 的硬上限。
 
-动态模式使用的总 budget 是：
+公共函数读取 backend 写入 batch 元数据的 `sp_size`，并计算：
 
 $$
-max\_token\_len\_per\_gpu \times sequence/context\ parallel\ size
+T_{\mathrm{target}}
+= \mathrm{max\_token\_len\_per\_gpu}\times s_{\mathrm{backend}}
 $$
 
-> **公式含义：** 动态切分时，engine 把“单个 GPU 的基础 token 预算”乘以参与分担序列计算的并行 rank 数，得到当前并行组可共同承受的总 token/workload 预算。
+> **公式含义：** 把单 GPU 的基础 token 配置乘以当前 backend 传入的倍率，得到用来推导 micro-batch 数量的 token 目标值。它回答的是“大约需要拆几批”，不是“每批绝对不得超过多少 token”。
 >
-> **符号说明：** `max_token_len_per_gpu` 是配置给单个 GPU 的最大 token 长度或等价工作量预算；`×` 表示乘法；`sequence/context parallel size` 是当前后端采用的序列并行（SP）或上下文并行（CP）组大小。名称中的 `/` 表示“根据后端二选一”，不是除法；`size` 表示该并行组包含多少个 rank。
+> **符号说明：** $T_{\mathrm{target}}$ 是用于拆批的目标 token 数，下标 `target` 表示“目标值”；$\mathrm{max\_token\_len\_per\_gpu}$ 就是配置项 `max_token_len_per_gpu`，表示单 GPU 的基础值，直立字体和下划线说明这是一个完整配置名；$s_{\mathrm{backend}}$ 是具体 backend 写入的 `sp_size`，下标 `backend` 表示它由后端决定；$\times$ 是乘号。
 
-这意味着动态 micro-batch 的行数不是常量：一批可以装很多短序列，也可能只能装一条长序列。`same_micro_num_in_dp=True` 会让不同 DP replica 拥有相同 micro-batch 数，避免 collective 或 pipeline schedule 次数不一致。
+$s_{\mathrm{backend}}$ 不是全后端通用的“SP/CP size”，当前实际映射是：
+
+- FSDP 与 VeOmni 写入 Ulysses size，见 [`fsdp/transformer_impl.py:700-703`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L700-L703) 与 [`veomni/transformer_impl.py:385-408`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/veomni/transformer_impl.py#L385-L408)；
+- Megatron 写入 `context_parallel_size`，见 [`megatron/transformer_impl.py:693-696`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L693-L696)；
+- TorchTitan 当前写入的是 `tensor_parallel_size`，不是 CP size，见 [`torchtitan/transformer_impl.py:337-353`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/torchtitan/transformer_impl.py#L337-L353)；
+- Automodel 当前没有写入 `sp_size`，因此公共函数使用默认值 1，见 [`automodel/transformer_impl.py:224-234`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/automodel/transformer_impl.py#L224-L234)。
+
+实现先用 `ceil(total_seqlen / T_target)` 推导批数，再按近似 attention workload 分区，见 [`seqlen_balancing.py:394-438`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/seqlen_balancing.py#L394-L438)。因此动态 micro-batch 的行数不是常量，而且某一批的 token 数可能超过 `T_target`；FSDP 源码对此有明确注释，见 [`fsdp/transformer_impl.py:647-654`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L647-L654)。`same_micro_num_in_dp=True` 会让不同 DP replica 拥有相同 micro-batch 数，避免 collective 或 pipeline schedule 次数不一致。
 
 FSDP 还会在非最后一个 micro-batch 暂停梯度同步，只在最后一次 backward 同步，见 [`fsdp/transformer_impl.py:672-748`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L672-L748)。
 
 ---
 
-## 10. 贯穿全书的 `P=2, n=3` shape 例子
+## 10. `P=2, n=3` 的等长并行推导例子
 
 假设：
 
-这里为展示 TP 数据复制关系，假设使用当前真正支持 TP 的 engine（例如 Megatron）；若沿用全书默认 FSDP，应把 `TP=1`，并把额外 GPU 放在 DP/FSDP 轴上。
+本节只沿用第 04 章的 `P=2, n=3, B=6` 计数关系，为展示 TP 数据复制和固定 shape，特意把六条 trajectory 简化成等长。这不是第 04 章那组 jagged 样本的同一组具体长度：那一例的 `input_ids` 总 token 数是 54，本节的等长变体是 60，见[第 04 章的完整 shape 例子](04_data_and_protocols.md)。
+
+为展示 TP 数据复制关系，这里假设使用当前真正支持 TP 的 engine（例如 Megatron）；若沿用全书默认 FSDP，应把 `TP=1`，并把额外 GPU 放在 DP/FSDP 轴上。
 
 ```text
 P = 2 prompts
@@ -599,13 +622,14 @@ ppo_micro_batch_size_per_gpu = 1
 ppo_epochs = 2
 ```
 
-### 10.1 Controller 看到的 shape
+### 10.1 trajectory 的语义 shape 与 worker 视图
 
-为方便理解，先用等长 dense 视图：
+V1 controller 主要持有 `KVBatchMeta`，不会直接读取这些 token tensor。为方便理解一批 trajectory 在 worker materialize 后的语义，先用等长 dense 视图：
 
 | 字段 | shape |
 |---|---|
-| `input_ids`、`attention_mask`、`position_ids` | `[6, 10]` |
+| `input_ids`、`position_ids` | `[6, 10]` |
+| `attention_mask` | `[6, 10]`（不作为 trajectory 字段持久化；Agent Loop 仅在生成 `position_ids` 时按 `input_ids` 临时构造） |
 | `responses` | `[6, 6]` |
 | `old_log_probs`、`advantages`、`response_mask` | `[6, 6]` |
 
@@ -679,7 +703,7 @@ micro-batch 0: 2 条短序列，packed tokens = 14
 micro-batch 1: 1 条长序列，packed tokens = 10
 ```
 
-此时决定拆分的是 token/workload budget，而非固定第一维。
+此时 token 目标值先决定批数，近似 attention workload 再决定样本组合，而不是按固定第一维切行；这个目标值仍不是逐个 micro-batch 的硬上限。
 
 ---
 
@@ -719,19 +743,22 @@ TP 和 PP 也能分担模型状态，但机制不同：TP 切每层矩阵，PP �
 
 - micro-batch 从 2 降到 1，batch 维相关 activation 约减半；
 - activation checkpointing 不保存部分中间结果，backward 时重算，以计算换显存；
-- dynamic token batch 让长短样本使用不同的行数，减少 padding 和偶发 OOM。
+- dynamic token batch 会按长度/workload 重组长短样本，通常能减少 padding 和 OOM 风险；但 token 目标值不是硬上限，单条过长样本仍可能 OOM。
 
 ### 11.3 Rollout KV cache 为什么又是另一套压力
 
 KV cache 每个 token 的粗略大小：
 
 $$
-2(K,V) \times layers \times kv\_heads \times head\_dim \times bytes
+B_{\mathrm{token}}
+= 2 \times L \times H_{\mathrm{KV}} \times d_{\mathrm{head}} \times b_{\mathrm{elem}}
 $$
 
 > **公式含义：** 这个乘积估算一条序列中“每缓存一个 token”需要多少字节：每层都要为该 token 保存 key 和 value，并覆盖所有 KV head 及每个 head 的向量维度。
 >
-> **符号说明：** `2(K,V)` 中的 `2` 表示 key（`K`）和 value（`V`）两份缓存，括号只是标明这两类张量；每个 `×` 都表示把各维度规模相乘；`layers` 是 Transformer 层数；`kv_heads` 是每层的 KV head 数；`head_dim` 是每个 head 的向量长度；`bytes` 是每个数值元素占用的字节数，例如 BF16 为 2 字节。下划线只是把多词变量名连起来。
+> **符号说明：** $B_{\mathrm{token}}$ 是每个 token 的 KV cache 字节数，$B$ 在这里表示 bytes，不是 batch size，下标 `token` 限定了统计单位；$2$ 表示 key（$K$）和 value（$V$）两份缓存；$L$ 是 Transformer 层数；$H_{\mathrm{KV}}$ 是每层的 KV head 数，下标 `KV` 说明这是 key/value heads；$d_{\mathrm{head}}$ 是每个 head 的向量维度；$b_{\mathrm{elem}}$ 是每个数值元素占用的字节数，例如 BF16 为 2，下标 `elem` 是 element（元素）的缩写；$=$ 表示两边是同一个估算量，每个 $\times$ 都表示把各维度规模相乘。
+
+这是标准 MHA/GQA 的**未分片逻辑总量**，不能直接当作任意并行配置的单卡用量：TP 可能切分或复制 KV heads，PP 会切层；MLA、量化 KV cache、prefix sharing 等机制也会改变这个估算。
 
 若有 32 层、8 个 KV heads、head dim 128、BF16：
 
@@ -798,7 +825,7 @@ actor/ref/critic 的 `infer_batch` 是：给定整段已知 token，一次 forwa
 training-side forward-only scoring != autoregressive rollout generation
 ```
 
-这也解释了为什么 rollout log-prob 与 actor 重算 log-prob 可能存在小的数值差异：它们使用不同 kernel、batching 和权重布局。PPO 主路径会显式计算并保存不同语义的 log-prob，而不是假定二者完全相同。
+这也解释了为什么 rollout log-prob 与 actor 重算 log-prob 可能存在小的数值差异：它们使用不同 kernel、batching 和权重布局。默认 decoupled 路径会把 rollout 计算的 `rollout_log_probs` 与 actor 重算的 `old_log_probs` 区分保存；`bypass_mode=True` 时则直接把前者复用为后者，并不执行这次重算。
 
 ---
 
@@ -811,19 +838,19 @@ training-side forward-only scoring != autoregressive rollout generation
 | 需求 | 当前优先考察 | 原因与限制 |
 |---|---|---|
 | 第一次读源码、复现默认小/中型 HF 模型 | FSDP/FSDP2 | 拓扑最直观；LM/value 都注册；默认 `model_engine=dp` 路径覆盖较完整 |
-| 必须使用统一 critic/value model | FSDP/FSDP2、Megatron、VeOmni | 当前只有这三类有 `value_model` 注册 |
+| 必须使用统一 critic/value model | FSDP/FSDP2、Megatron、VeOmni | 当前只有这些 backend key 有 `value_model` 注册；NPU 上的 Megatron key 由 MindSpeed value alias 实现，独立 `mindspeed_megatron` key 没有 value 注册 |
 | 大 dense 模型必须 TP + PP | Megatron | 当前明确实现 pipeline schedule；模型需有 Bridge/provider 支持 |
 | 长上下文，需要序列/上下文并行 | FSDP/VeOmni 的 Ulysses SP，或 Megatron CP；也可评估 TorchTitan CP | 先验证目标 attention/model 路径 |
 | 大型 MoE，需要显式 EP | Megatron、VeOmni；也可评估 TorchTitan/Automodel | kernel、router、weight export 和目标模型支持比“EP 字段存在”更重要 |
 | 希望研究 TorchTitan N-D/SPMD 路径 | TorchTitan | 需要匹配 nightly；PP 当前不可用；无 value engine |
 | 已使用 NeMo Automodel/TE/DeepEP 生态或做 SFT | Automodel | 当前现成例子以 SFT 为主；PP=1；无 value engine |
-| NPU | FSDP、VeOmni、TorchTitan 的静态注册；Megatron key 由 MindSpeed 路由 | Automodel 当前仅 CUDA；静态注册仍需端到端模型/依赖验证 |
+| NPU | FSDP、VeOmni、TorchTitan 的静态注册；Megatron key 与独立 `mindspeed_megatron` key 由 MindSpeed 路由 | 独立 `mindspeed_megatron` 只有 LM；Automodel 当前仅 CUDA；静态注册仍需端到端模型/依赖验证 |
 
 ### 13.2 一套实际选择流程
 
-1. **算法是否需要 critic？** 需要就先排除当前 TorchTitan/Automodel value 路径；GRPO 无 critic 时选择面更大。
+1. **算法是否需要 critic？** 需要就先排除当前独立 `mindspeed_megatron`、TorchTitan 和 Automodel value 路径；NPU 上可用的是 `backend="megatron"` 的 MindSpeed value alias。GRPO 无 critic 时选择面更大。
 2. **最小并行方案能否装下？** 先尝试最少的并行维度。多一个 TP/PP/CP/EP 轴，就多一类通信和故障模式。
-3. **是否真的需要 PP？** 当前五类内置实现中应优先看 Megatron；不要因为 TorchTitan/Automodel config 有字段就打开。
+3. **是否真的需要 PP？** 当前六类内置路径中应优先看 Megatron 及继承其调度的 MindSpeed 路径；不要因为 TorchTitan/Automodel config 有字段就打开。
 4. **目标模型是否被后端建模和权重转换支持？** 检查 Bridge、VeOmni registry、TorchTitan model registry 或 Automodel loader。
 5. **rollout 权重能否正确同步？** 至少验证一次 actor update 后的 HF-keyed export、rollout reload 和 logits/log-prob 数值。
 6. **再比较吞吐。** 在相同 global batch、token 数、dtype、checkpointing 和 rollout 配置下比较 MFU、step time 与 peak memory。
@@ -841,7 +868,7 @@ defaults:
   - critic@critic: ${model_engine}_critic
 ```
 
-真实默认组合见 [`ppo_trainer.yaml:7-31`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/ppo_trainer.yaml#L7-L31)。因此从 FSDP 切 Megatron/VeOmni/TorchTitan 时，应优先使用完整 `model_engine=...` composition，再调整对应的并行字段。只覆盖外层 `actor.strategy`，却留下另一类 engine config/optimizer/checkpoint，可能得到一个表面能解析、运行时才失败的混合配置。
+真实默认组合见 [`ppo_trainer.yaml:7-31`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/ppo_trainer.yaml#L7-L31)。因此从 FSDP 切 Megatron、MindSpeed、VeOmni 或 TorchTitan 时，应优先使用完整 `model_engine=...` composition，再调整对应的并行字段。只覆盖外层 `actor.strategy`，却留下另一类 engine config/optimizer/checkpoint，可能得到一个表面能解析、运行时才失败的混合配置。还要注意，`model_engine=mindspeed` 选择的是只有 LM 注册的独立 `mindspeed_megatron` key，不能与需要统一 critic 的算法组合。
 
 Automodel 当前没有对应的 PPO `model_engine/automodel.yaml` 组合，仓库提供的是独立 engine/optimizer 配置和 SFT 示例；这也是为什么不应把它当作当前 turnkey PPO backend 宣传。
 
@@ -900,12 +927,12 @@ TP/PP/CP rank
 | OOM 阶段 | 首先怀疑 | 常见控制项 |
 |---|---|---|
 | engine initialize | 参数/optimizer 常驻状态 | FSDP/TP/PP、dtype、optimizer offload |
-| actor/ref scoring forward | logits、长序列 activation | infer micro-batch、dynamic token budget、remove padding、chunked entropy |
+| actor/ref scoring forward | logits、长序列 activation | infer micro-batch、dynamic token target、remove padding、chunked entropy |
 | backward | saved activation、gradient、临时 logits | training micro-batch、activation checkpointing、TP/SP、fused loss |
 | weight sync | full parameter gather、格式转换副本 | shard/delta export 支持、bucket size、offload 时机 |
 | rollout generation | KV cache 与并发请求 | max tokens、并发数、rollout TP、cache utilization |
 
-只降低 `ppo_mini_batch_size` 不一定能修复单次 forward OOM；真正控制 forward 峰值的通常是 micro-batch 或 token budget。反过来，micro-batch 很小也不会减少 optimizer state 常驻显存。
+只降低 `ppo_mini_batch_size` 不一定能修复单次 forward OOM；固定模式下，micro-batch 行数会直接影响单次 forward 规模；动态模式下，token 目标值只启发式地决定拆批数量，并不保证每批都低于它，单条过长样本仍可能 OOM。反过来，micro-batch 很小也不会减少 optimizer state 常驻显存。
 
 ---
 
@@ -919,12 +946,12 @@ TP/PP/CP rank
 4. actor/ref 都是 `language_model`；critic 是 `value_model`；rollout 不走 `EngineRegistry`。
 5. `BaseEngine.train_batch` 的一次调用只做一次 optimizer step；micro-batch 在内部累积梯度。
 6. DP 切样本；TP 切层内张量；PP 切模型层。相同 DP rank 的 TP/PP ranks 必须收到同一份数据。
-7. 当前统一 critic 可用的五类后端只有 FSDP/FSDP2、Megatron、VeOmni。
+7. 当前六类后端中，有统一 `value_model` 注册的是 FSDP/FSDP2、Megatron（NPU key 由 MindSpeed alias 实现）和 VeOmni；独立 `mindspeed_megatron`、TorchTitan、Automodel 没有。
 8. TorchTitan 虽有 PP 配置字段，当前 forward 仍拒绝 PP；Automodel 当前也强制 `pp_size=1`。
 9. training-side scoring 与 rollout generation 是不同工作负载，因此使用两套 runtime，并通过权重同步保持策略版本一致。
 10. 选择后端时，以“registry + import + model support + 实际实现 + e2e 验证”为证据链，而不是看名字或 YAML 文件。
 
-下一章将沿着本章最后的权重同步箭头继续：训练 engine 更新出 $\theta_{new}$ 后，vLLM/SGLang 等 rollout server 如何 sleep、接收参数、恢复 KV cache 并开始下一轮采样。
+下一章将沿着本章最后的权重同步箭头继续：训练 engine 更新出 $\theta_{\mathrm{new}}$ 后，vLLM/SGLang 等 rollout server 如何 sleep、接收参数、恢复 KV cache 并开始下一轮采样。
 
 > **公式含义：** 这个公式表示 actor 完成一次或多次 optimizer update 后得到的新版参数，rollout server 随后需要加载这版参数。
 >
@@ -944,5 +971,5 @@ TP/PP/CP rank
 | Registry 如何注册/选择？ | [`EngineRegistry`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/base.py#L337-L443) |
 | mini/micro-batch 在哪里切？ | [`TrainingWorker.train_mini_batch`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L241-L333)、[`prepare_micro_batches`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/utils.py#L83-L121) |
 | DP dispatch 如何复制给 MP ranks？ | [`verl/single_controller/base/decorator.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/base/decorator.py#L202-L304) |
-| 五类 backend 配置有哪些字段？ | [`verl/workers/config/engine.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L77-L646) |
+| 六类 backend 配置有哪些字段？ | [`verl/workers/config/engine.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L77-L670) |
 | rollout 为什么是另一套接口？ | [`verl/workers/rollout/base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/base.py#L29-L109) |

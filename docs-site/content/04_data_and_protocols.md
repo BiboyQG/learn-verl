@@ -176,9 +176,9 @@ V1 trainer 使用 `StatefulDataLoader`，默认训练 loader 的 batch size 是 
 
 > 项目中还有另一个同名函数：[`verl.protocol.collate_fn`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/protocol.py#L296-L306)。它服务于 `DataProto.make_iterator()`，输入是 `DataProtoItem`，输出是 mini-batch `DataProto`。这两个 `collate_fn` 处在完全不同的阶段，不要混淆。
 
-## 4.5 当前 V1 的三层数据模型
+## 4.5 当前 V1 的四层数据模型
 
-V1 不再让 controller 一直搬运一个巨大的 padded `DataProto`。理解它最简单的方法，是把数据系统分成三层。
+V1 不再让 controller 一直搬运一个巨大的 padded `DataProto`。理解它最简单的方法，是把数据系统分成四层。
 
 ### 1. `TensorDict`：一批字段的容器
 
@@ -236,10 +236,15 @@ KVBatchMeta
 ├── partition_id    # 例如 "train"
 ├── keys            # trajectory keys
 ├── tags            # seq_len、status、global_steps 等轻量元数据
+├── fields           # 可选：本次调用只选择哪些字段
 └── extra_info      # 本次计算需要的控制参数
 ```
 
-`ReplayBuffer._materialize_batch()` 只组装 keys 与 tags（[`replay_buffer.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L366-L389)）。真正的 tensor 字段仍然留在 TransferQueue，需要某个 worker 计算时才按 key 拉取。
+`ReplayBuffer._materialize_batch()` 只组装 keys 与 tags（[`replay_buffer.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L366-L389)）。`fields` 通常由后续调用按需指定；真正的 tensor 字段仍留在 TransferQueue。
+
+### 4. `BatchMeta`：dispatch/RPC 的物理索引桥
+
+controller 侧的 key 在 DP dispatch 前不会原样交给每个 worker。`BatchData.chunk()` 会先把 `KVBatchMeta` [解析成 `BatchMeta`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/protocol.py#L1271-L1289)，其中包含 `global_indexes`、`partition_ids` 与 `field_names` 等物理定位信息，再按 rank 切 shard。worker bridge 根据这个 `BatchMeta` 从 TQ materialize 本地 `TensorDict`；blocking collect 则先 concat 各 shard 的 `BatchMeta`，再转回 controller 侧的 `KVBatchMeta`（[`protocol.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/protocol.py#L1306-L1319)）。
 
 可以把它类比为：
 
@@ -261,8 +266,9 @@ flowchart TD
     E --> F["AgentLoopWorkerTQ<br/>每个 prompt 启动 n 个 session"]
     F --> G["TransferQueue<br/>存放变长 trajectory 字段"]
     G --> H["ReplayBuffer.sample<br/>选择 prompt group"]
-    H --> I["KVBatchMeta<br/>只携带 keys / tags"]
-    I --> J["old log-prob / ref log-prob / values<br/>worker 按 key 读取并回写字段"]
+    H --> I["KVBatchMeta<br/>keys / tags / optional fields"]
+    I --> BM["dispatch bridge<br/>KVBatchMeta → BatchMeta shard"]
+    BM --> J["worker materialize TensorDict<br/>计算并回写字段"]
     J --> K["临时 padded DataProto<br/>reward / KL / advantage"]
     K --> L["advantages / returns<br/>转回 jagged 并写回 TransferQueue"]
     L --> M["actor / critic train_mini_batch<br/>按 DP 与 mini-batch 切分"]
@@ -442,17 +448,17 @@ GAE 需要：
 token_level_rewards + values + response_mask
 ```
 
-它从 response 尾部向前递推，输出 `[B, R]` 的 `advantages` 与 `returns`（[`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263)）。工具 observation 位置的 `response_mask=0`：该位置自身的 value 与 TD error 会被跳过，已有的 running advantage 会继续向前传递；真正计算策略损失时，`loss_mask=0` 再将 observation 位置排除。
+它从 response 尾部向前递推，输出 `[B, R]` 的 `advantages` 与 `returns`（[`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263)）。工具 observation 位置的 `response_mask=0`：该位置自身的 value 与 TD error 会被跳过，已有的 running advantage 会继续向前传递。当前 Agent Loop 写入时令 `loss_mask=response_mask`，但 V1 PPO policy loss [实际直接读取 `response_mask`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L85-L109) 来排除 observation。
 
 ### GRPO 路径
 
-GRPO 首先对每条 trajectory 的 token reward 求和得到 scalar score，再按相同 `uid` 分组：
+GRPO 首先对每条 trajectory 的 token reward 求和得到 scalar score，再按相同 `uid` 分组。组内样本数大于 1 时：
 
 ```text
 adv_i = (score_i - group_mean) / (group_std + epsilon)
 ```
 
-最后将同一个 scalar advantage 广播到该 trajectory 中所有 `response_mask=1` 的 token（[`compute_grpo_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L266-L331)）。
+如果某组只有 1 条样本，当前实现特判为 `group_mean=0`、`group_std=1`，所以启用标准差归一化时 advantage 约等于原 score，而不是自动变成 0。最后将同一个 scalar advantage 广播到该 trajectory 中所有 `response_mask=1` 的 token（[`compute_grpo_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L266-L331)）。
 
 对可能一次返回多段 output 的 AgentLoop，V1 会只用每个 session 的最后一段 output 计算 GRPO，再把结果广播回同 session 的其他 output（[`compute_advantage_for_multi_trajectories`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/utils.py#L148-L216)）。
 
@@ -482,8 +488,9 @@ worker 收到 batch 后，`train_mini_batch()` 做三件事（[`engine_workers.p
 所以不要想象成“controller 先把整个训练 batch 放上某一张 GPU”。实际过程更接近：
 
 ```text
-controller 调度 keys
-  -> DP worker 拉取自己的数据 shard
+controller 调度 KVBatchMeta
+  -> dispatch 将 keys 解析为 BatchMeta 并按 DP 切 shard
+  -> worker 按物理索引 materialize 自己的 TensorDict
   -> worker 切 mini-batch
   -> backend 切 micro-batch
   -> 当前 micro-batch 上 GPU
@@ -542,7 +549,7 @@ data = DataProto(
 
 当前 V1 主干中：
 
-- 长期 trajectory 存储：TransferQueue 中的 jagged TensorDict。
+- 长期 trajectory 存储：TransferQueue 中的 TensorDict；变长字段通常是 jagged `NestedTensor`，等 shape 字段可以是 dense tensor。
 - controller 调度：KVBatchMeta。
 - worker 训练：TensorDict/NestedTensor。
 - reward model 适配与 advantage 算法复用：临时构造 padded DataProto。
@@ -717,7 +724,7 @@ DataLoader 层是两个 prompt；rollout 后通常是六条 trajectory。所有 
 
 ### 误区 4：V1 controller 手中一直有全部 token tensors
 
-controller 更多时候持有 `KVBatchMeta`。序列留在 TransferQueue，worker 按 key 取用和回写。
+controller 更多时候持有 `KVBatchMeta`。序列留在 TransferQueue；dispatch 先把 key 解析为 `BatchMeta` 的物理索引，worker 再据此取用和回写。
 
 ### 误区 5：`union` 会增加 batch size
 
@@ -735,7 +742,7 @@ controller 更多时候持有 `KVBatchMeta`。序列留在 TransferQueue，worke
 4. trajectory tag：确认 `prompt_len`、`response_len`、`seq_len`。
 5. mask：分别统计有效 response token 与 loss token。
 6. reward：确认每条 trajectory 的 `rm_scores.sum()`。
-7. group：确认 GRPO 的相同 uid 恰好包含期望的 `n` 条 rollout。
+7. group：确认 GRPO 的相同 `uid` 有期望的 `n` 个 distinct `session_id`；一个 session 若产生多段 output，可以包含多个 `index`/trajectory row。
 8. update：确认 effective mini-batch、DP size 与本地 batch 的整除关系。
 
 一个实用的 shape 日志模板是：

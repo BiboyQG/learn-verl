@@ -108,7 +108,9 @@ old_log_probs = rollout_log_probs
 ```
 
 即只有 $\pi_{rollout}$ 与 $\pi_\theta$ 两个动态 policy：前者仍是上表中负责生成 token 的策略，后者仍是参数会被 optimizer 更新的当前策略。对应逻辑见
-[`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1480-L1493)。bypass mode 还可以在 PPO-clip 和显式 REINFORCE+importance-sampling loss 之间选择；这是高级 off-policy 主题，不是普通 PPO 必需配置。
+[`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1480-L1493)。在本章固定快照的 V1 路径中，这个开关只完成上述替换；actor 的 `policy_loss.loss_mode` 仍保持原配置，默认 `vanilla` 因而得到以 $\pi_{rollout}$ 为分母的 PPO clipped loss。
+
+代码库另有已注册的 [`compute_policy_loss_bypass_mode`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L2410-L2546)，它可以在 PPO-clip 与显式 REINFORCE+importance-sampling loss 间选择。legacy trainer 通过 [`apply_bypass_mode`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/rollout_corr_helper.py#L1109-L1144) 把 algorithm correction config 注入 actor config，并把 `loss_mode` 切成 `bypass_mode`；这只是现成的 wiring helper，不是该 loss 的唯一入口。等效的手工配置也可以设置 actor 的 `policy_loss.loss_mode=bypass_mode`，并为 `policy_loss.rollout_correction` 提供对应配置。当前 V1 orchestration 不会从 algorithm 层自动做这项传播，而且在 advantage 阶段显式跳过 bypass correction（[`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1607-L1617)）。因此只设置 `algorithm.rollout_correction.loss_type=reinforce` 不会改变 V1 actor loss，bypass 下的 rejection/current-vs-rollout correction 分支也没有自动接通；这是固定快照的 wiring 边界。
 
 ---
 
@@ -346,7 +348,7 @@ $$
 +c_{\mathrm{KL}}\,\widehat{\mathcal K}_{\mathrm{ref}}.
 $$
 
-**公式含义：** actor 最终最小化的 loss 由三部分相加：policy-gradient 主损失、带负号的 entropy 奖励、带正号的 sampled reference-policy penalty。负号让更高 entropy 降低总 loss，正号让采样动作在当前 policy 与 reference policy 下的差异提高总 loss。把最后一项写成通用的 $\widehat{\mathcal K}_{\mathrm{ref}}$，是因为它是否能严格解释成某一方向的 KL，取决于 estimator 类型与动作的实际采样分布。
+**公式含义：** actor 最终最小化的 loss 由三部分相加：policy-gradient 主损失、带负号的 entropy 奖励、乘正系数后加入的 sampled reference-policy estimator。负号让更高 entropy 降低总 loss；正系数表示把最后一项按原符号加进 loss，并不保证每个样本都会使总 loss 增大——例如 `kl`/`k1` 的单 token 估计可以为负。把最后一项写成通用的 $\widehat{\mathcal K}_{\mathrm{ref}}$，是因为它的数值正负、以及能否在期望意义下解释成某一方向的 KL，都取决于 estimator 类型与动作的实际采样分布。
 
 **符号说明：**
 
@@ -378,12 +380,12 @@ algorithm:
 会使用 REINFORCE++ 计算 advantage，但 policy loss 仍是 PPO clipped loss。
 
 如果真要用无 clipping 的 $-A\log\pi$ loss（$A$ 是 advantage，$\pi$ 是策略给已采样动作的概率，$\log$ 是自然对数，前置负号把“最大化收益”改写为优化器可最小化的 loss），当前专门实现是
-[`compute_policy_loss_reinforce`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L2330-L2407)，它由 `bypass_mode` 的 `loss_type=reinforce` 分支调用，见
-[`compute_policy_loss_bypass_mode`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L2410-L2546)。不要仅凭 estimator 名字推断 loss。
+[`compute_policy_loss_reinforce`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L2330-L2407)，已注册的 `bypass_mode` loss 可在 `loss_type=reinforce` 时调用它，见
+[`compute_policy_loss_bypass_mode`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L2410-L2546)。但第 2.2 节说明了当前 V1 不会仅凭 algorithm 层的 `bypass_mode/loss_type` 自动选择这个注册项；不要仅凭 estimator 名字或未接线的配置字段推断实际 loss。
 
 ### 5.2 其他 policy loss
 
-`core_algos.py` 还注册了 `dppo_tv`、`dppo_kl`、`gspo`、`sapo`、`gpg`、`clip-cov`、`kl-cov`、`geo_mean`、`dro`、`cispo` 等 loss。它们共享相同的 dispatch 接口：
+`core_algos.py` 还注册了 `dppo_tv`、`dppo_kl`、`gspo`、`sapo`、`gpg`、`clip_cov`、`kl_cov`、`geo_mean`、`dro`、`cispo` 等 loss。它们共享相同的 dispatch 接口：
 
 ```python
 (old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, config, ...)
@@ -642,19 +644,21 @@ value loss        = 0.5 * max(0.01, 0.16) = 0.08
 
 虽然 `new value=0.9` 很接近 target，但它一次从 0.4 跳得太远，不能靠“刚好更接近 target”逃过惩罚。这与 PPO policy clipping 的保守更新思想一致。
 
-critic 配置有自己的：
+critic 配置 schema 有自己的：
 
 ```yaml
 critic:
   ppo_mini_batch_size: ...
-  ppo_micro_batch_size_per_gpu: ...
+  ppo_micro_batch_size_per_gpu: ...  # schema/validation field; V1 wiring 见下文
   ppo_epochs: ...
   cliprange_value: ...
   loss_agg_mode: ...
   loss_scale_factor: ...
 ```
 
-actor 和 critic 可以有不同的 mini/micro batch 与 epoch 数。critic 的 `loss_agg_mode` 与 `loss_scale_factor` 默认继承 actor 对应设置，也可以显式覆盖。
+actor 和 critic 可以有不同的 mini-batch 与 epoch 数。critic 的 `loss_agg_mode` 与 `loss_scale_factor` 默认继承 actor 对应设置，也可以显式覆盖。但在本章固定的 V1 源码中，不能进一步声称 critic 的 training micro-batch 也可通过 top-level `critic.ppo_micro_batch_size_per_gpu` 独立调整：V1 创建 standalone critic worker 时没有把该字段、`critic.use_dynamic_bsz` 或 `critic.ppo_max_token_len_per_gpu` 写入 engine config，见
+[`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L248-L268)。实际的 critic engine 分包只读取 engine config，见
+[`engine_workers.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L335-L362)。第 11.6 节给出这个固定版本的具体 wiring。
 
 ---
 
@@ -758,7 +762,7 @@ $$
 
 **符号说明：** $C_{\text{norm}}$ 是所有轨迹共用的正归一化常数，不随下标 $i$ 或 $t$ 改变；下标 `norm` 说明它用于 normalization，与第 4.3 节的 dual-clip 阈值 $C_{\text{clip}}$ 无关。$1/B_{\text{agg}}$、两个求和、mask $m_{i,t}$、token loss $\ell_{i,t}$ 和总 loss $\mathcal L$ 均沿用上文。
 
-$C_{\text{norm}}$ 来自 `actor.loss_scale_factor`；它就是上式分母中的归一化常数。若为 `null`，当前实现回退到**当前 micro-batch** 的 padded horizon。dynamic/ragged 分包产生不同宽度时，这个 horizon 可能变化，所以此模式下只有显式设置固定 `loss_scale_factor`，才能保证归一化因子不随 micro-batch 切法改变。把 $C_{\text{norm}}$ 设成固定 `max_response_length` 是 Dr.GRPO 常见设置，可避免这种漂移。现有说明见
+actor loss 的 $C_{\text{norm}}$ 来自 `actor_rollout_ref.actor.loss_scale_factor`；critic value loss 则使用 `critic.loss_scale_factor`，后者默认继承 actor 的设置，但可以显式覆盖。它就是上式分母中的归一化常数。若对应字段为 `null`，当前实现回退到**当前 micro-batch** 的 padded horizon。dynamic/ragged 分包产生不同宽度时，这个 horizon 可能变化，所以此模式下只有显式设置固定 `loss_scale_factor`，才能保证归一化因子不随 micro-batch 切法改变。把 $C_{\text{norm}}$ 设成固定 `max_response_length` 是 Dr.GRPO 常见设置，可避免这种漂移。现有说明见
 [`docs/algo/grpo.md`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/docs/algo/grpo.md#L51-L62)。
 
 ### 10.6 一个长度例子
@@ -920,16 +924,18 @@ micro-batch 不再固定包含 $b_\mu$ 条 trajectory。实现先用 `ppo_max_to
 
 dynamic batching 改变的是 micro-batch 形状和数量；在支持全局归一化的 aggregation 下，不改变上层 mini-batch 应代表的全局 objective。`seq-mean-token-sum-norm` 且 `loss_scale_factor=null` 仍是例外，因为其回退 horizon 可能随分块宽度变化。
 
-### 11.6 log-prob/value inference 有独立 micro-batch
+### 11.6 log-prob 与 critic value 的实际 inference/training wiring
 
-不要把训练 micro-batch 与这些 forward-only 配置混在一起：
+对 actor/ref，不要把训练 micro-batch 与这些 forward-only 配置混在一起：
 
 - `actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu`：重算 actor old log-prob。
 - `actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu`：计算 reference log-prob。
 - actor/ref 相应的 `*_max_token_len_per_gpu`：dynamic forward token budget。
-- `critic.ppo_infer_max_token_len_per_gpu`：当前 V1 接到 critic engine 的 inference token budget；固定版本的默认 YAML 未声明它，Hydra CLI 新增时需要 `+critic.ppo_infer_max_token_len_per_gpu=...`。
 
-它们主要影响推理阶段显存和吞吐，不等于 optimizer mini-batch。`critic.forward_micro_batch_size_per_gpu` 属于 legacy 路径，当前固定版本的 V1 setup 没有把它接成有效的 fixed critic-inference micro-batch 旋钮。
+它们主要影响 actor/ref 的推理显存和吞吐，不等于 optimizer mini-batch。critic 是当前 V1 的例外：setup 把 `critic.ppo_infer_max_token_len_per_gpu` **同时**写入 `engine.infer_max_token_len_per_gpu` 和训练用的 `engine.max_token_len_per_gpu`，见
+[`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L248-L268)。因此尽管字段名带 `infer`，它在这个固定版本中也控制 critic dynamic training 的 token budget；默认 YAML 未声明该字段，Hydra CLI 新增时需要 `+critic.ppo_infer_max_token_len_per_gpu=...`。
+
+反过来，当前 V1 setup 没有传播 top-level `critic.use_dynamic_bsz`、`critic.ppo_max_token_len_per_gpu`、`critic.ppo_micro_batch_size_per_gpu` 或 `critic.ppo_infer_micro_batch_size_per_gpu` 到 engine。`critic.forward_micro_batch_size_per_gpu` 也属于 legacy 路径字段。所以这些都不是当前固定 V1 中有效的 fixed critic training/inference micro-batch 旋钮；这是源码 wiring 的字面结果，不应由字段名推断其必然生效。
 
 ---
 
@@ -1050,9 +1056,13 @@ actor_rollout_ref:
 critic:
   enable: true
   ppo_mini_batch_size: 64
-  ppo_micro_batch_size_per_gpu: 2
+  # 避免把未接线的 fixed critic micro-batch 当成有效 engine 旋钮
+  use_dynamic_bsz: true
   ppo_epochs: 1
 ```
+
+这里特意不写 `critic.ppo_micro_batch_size_per_gpu`：它存在于 critic config schema，但没有被固定 V1 setup 传播到 standalone critic engine。`critic.use_dynamic_bsz=true` 会让 top-level critic config 跳过 fixed-micro 字段校验；它同样没有被 setup 传播，而当前 engine config 本身默认使用 dynamic batching，见
+[`engine.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L76-L108)。若需在该版本调整 critic 实际使用的 dynamic training/inference token budget，当前 Hydra CLI 路径是 `+critic.ppo_infer_max_token_len_per_gpu=...`；这一个值会同时接到两种 forward。
 
 数据流：
 
@@ -1120,18 +1130,23 @@ critic:
 vanilla policy loss 返回的核心指标在
 [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L1365-L1374)。
 
+先限定“比例”的聚合语义：`actor/pg_clipfrac`、`actor/ppo_kl`、`actor/pg_clipfrac_lower` 和 `critic/vf_clipfrac` 先在当前 micro-batch 上做 masked mean，训练 worker 再对 micro-batch/DP rank 的这些标量做等权平均。实现将 policy-gradient metrics 标成 `AggregationType.MEAN`，见
+[`workers/utils/losses.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L114-L119)；等权聚合见
+[`utils/metric/utils.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/metric/utils.py#L127-L156)。critic 的 `vf_clipfrac` 也是每个 micro-batch 生成的 raw masked-mean 标量，见
+[`workers/utils/losses.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L186-L203)。因此固定等大分包且每块有效 token 数相同时，可把它们读成 global token 比例；dynamic batching 下各 micro-batch 有效 token 数不同时，这些日志不是按 token 数加权的 global mean。
+
 | 指标 | 含义 | 常见异常信号 |
 |---|---|---|
 | `actor/pg_loss` | 聚合后的 policy-gradient loss | 只看正负没有意义，要结合 advantage scale |
-| `actor/pg_clipfrac` | 使用 clipped surrogate 的 token 比例 | 长期很高：更新过大、epoch/学习率可能太激进；长期 0：policy 几乎没移动 |
-| `actor/ppo_kl` | current 与 PPO old policy 的采样近似差异 | 不是 reference KL；突增说明 PPO update 远离 anchor |
-| `actor/pg_clipfrac_lower` | dual-clip 对负 advantage 生效比例 | 异常高可能有极端 ratio 或大量负 advantage |
+| `actor/pg_clipfrac` | 各 micro-batch 内使用 clipped surrogate 的 token 比例之等权汇总 | 长期很高：更新过大、epoch/学习率可能太激进；长期 0：policy 几乎没移动 |
+| `actor/ppo_kl` | 各 micro-batch 内 current 与 PPO old policy 采样近似差异的等权汇总 | 不是 reference KL；突增说明 PPO update 远离 anchor |
+| `actor/pg_clipfrac_lower` | 各 micro-batch 内 dual-clip 对负 advantage 生效比例的等权汇总 | 异常高可能有极端 ratio 或大量负 advantage |
 | `actor/entropy_loss` | 按 `loss_agg_mode` 聚合的 masked entropy | 快速塌缩可能意味着探索消失；只有 mean 模式才能直接读作 mask 内平均 |
-| `actor/kl_loss` / `actor/kl_coef` | loss-side reference KL 与系数 | KL 远大于 PG loss 时可能主导训练 |
+| `actor/kl_loss` / `actor/kl_coef` | 未乘权的 loss-side reference estimator 与系数 | 应比较 `kl_coef × kl_loss` 与 `pg_loss`；raw `kl_loss` 更大不代表一定主导，`k1` 样本值还可能为负 |
 | `actor/reward_kl_penalty` | reward-side 当前 KL 估计 | 与 `actor/ppo_kl` 对比对象不同 |
 | `actor/reward_kl_penalty_coeff` | reward-side 当前 $\beta$；$\beta$（beta）是第 7.1 节从 reward 中扣除 KL 罚分时使用的系数 | adaptive controller 下会变化 |
 | `critic/vf_loss` | value regression loss | 长期很大说明 critic/return scale 不匹配 |
-| `critic/vf_clipfrac` | value clipping 生效比例 | 很高说明 critic 更新步幅过大 |
+| `critic/vf_clipfrac` | 各 micro-batch 内 value clipping 生效比例的等权汇总 | 很高说明 critic 更新步幅过大 |
 
 不要用单一 loss 曲线判断 RL 是否成功。至少同时看：
 

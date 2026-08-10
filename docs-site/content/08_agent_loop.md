@@ -79,7 +79,7 @@ Ray actor 则提供跨进程、跨节点的 worker：
 
 在本教程里，一条 trajectory 指“一次完整 rollout”：从初始 prompt 开始，到 agent 决定结束为止。它可能只有一个 assistant turn，也可能包含多次模型生成和环境 observation。
 
-注意：源码中的 [`get_trajectory_info()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L1144) 只生成 trace 标签 `step/sample_index/rollout_n/validate`，它本身不是承载 token 的 trajectory 对象。真正的终态数据由 `AgentLoopOutput` 承载。
+注意：源码中的 [`get_trajectory_info()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L1144-L1163) 生成每条样本的调度/trace 元数据 `step/sample_index/rollout_n/validate`。其中 `validate` 还会继续传给 postprocess，用于控制 teacher logprob 和结果写入 train/val partition 的行为；但这个字典本身不承载 token，真正的终态数据由 `AgentLoopOutput` 承载。
 
 ---
 
@@ -108,7 +108,7 @@ flowchart LR
 - **`AgentLoopManager`** 管的是 CPU-side agent workers；
 - **`LLMServerManager`** 管的是 GPU-side inference replicas。
 
-而 [`AgentLoopBase.server_manager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L219) 这个属性虽然叫 `server_manager`，实际注入的是一个 **`LLMServerClient`**，不是 `LLMServerManager`。
+而 [`AgentLoopBase.server_manager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L219-L232) 这个属性虽然叫 `server_manager`，实际注入的是一个 **`LLMServerClient`**，不是 `LLMServerManager`。
 
 ---
 
@@ -132,7 +132,7 @@ class AgentLoopBase(ABC):
 其中：
 
 - `sampling_params` 是 temperature、top-p、top-k、是否返回 logprob 等生成参数；
-- `kwargs` 是 dataset row 中进入 rollout 的非 tensor 字段，例如 `raw_prompt`、`reward_model`、`extra_info`、`tools_kwargs`；
+- V0 中的 `kwargs` 主要来自 dataset 的 `non_tensor_batch`；V1 会同时传入 tensor/non-tensor row 字段，以及 `uid`、`global_steps`、`session_id` 等框架字段。自定义 loop 应保留 `**kwargs`，但只读取自己需要的 key；
 - 返回值必须描述 policy 实际经历的 token trajectory。
 
 基类还提供：
@@ -144,7 +144,7 @@ class AgentLoopBase(ABC):
 
 ### 4.2 `AgentLoopOutput`：agent 与训练系统的边界
 
-核心 schema 在 [`AgentLoopOutput`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L90)：
+核心 schema 在 [`AgentLoopOutput`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L90-L114)：
 
 ```python
 class AgentLoopOutput(BaseModel):
@@ -158,6 +158,7 @@ class AgentLoopOutput(BaseModel):
     num_turns: int = 0
     metrics: AgentLoopMetrics
     extra_fields: dict[str, Any] = {}
+    mm_processor_kwargs: dict[str, Any] | None = None
 ```
 
 它故意不强制 agent 必须使用 message、tool 或某一种状态机。训练侧真正需要的最小信息只是：
@@ -165,6 +166,8 @@ class AgentLoopOutput(BaseModel):
 1. 初始 prompt token；
 2. prompt 之后发生的全部 token；
 3. 哪些 response token 是 policy 自己生成的 action。
+
+这三项指的是 **token 语义上的最小边界**。要实际构造当前 Pydantic schema，仍必须传入 `metrics`；VLM 或 audio/video 路径还应保留 `mm_processor_kwargs`，使 rollout 与训练侧 processor/backend 参数保持对齐。
 
 ### 4.3 `AgentLoopWorker`：并发运行很多 trajectory
 
@@ -180,7 +183,7 @@ class AgentLoopOutput(BaseModel):
 
 ### 4.4 `AgentLoopManager`：把 batch 分给 workers
 
-[`AgentLoopManager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L1166) 创建多个 Ray `AgentLoopWorker`，按节点 round-robin 放置，再把 batch 切成 chunks 下发。
+[`AgentLoopManager`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L1166-L1220) 创建多个 Ray `AgentLoopWorker`，round-robin 选择目标节点的 **soft node affinity**，再把 batch 切成 chunks 下发。因为 `soft=True`，目标节点资源不可用时 Ray 可以把 actor 调度到其他节点；这不是硬 placement 保证。
 
 `agent.num_workers` 表示 **AgentLoop Ray actor 数量**，不是：
 
@@ -198,6 +201,8 @@ V1 没有复制一套 agent 实现，而是用 [`agent_loop_tq.py`](https://gith
 - worker 按 `rollout.n` 为一个 prompt 建立多个 session；
 - 结果以变长 tensor 写入 TransferQueue；
 - ReplayBuffer 根据 prompt group 收集完整 rollout。
+
+adapter 能为一个 session 返回的多个 `AgentLoopOutput` 分配独立 key 并写入 TQ，但支持尚未完全覆盖所有辅助路径：当前 distillation teacher logprob 只对最后一个 output 计算，[源码仍有明确 TODO](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L150-L175)。因此“multi-output 支持”应理解为 **存储、key 和 reward 主路径已接线**，不是所有训练功能都已对每个 output 完整接线。
 
 ### 4.6 `LLMServerManager` / `LLMServerClient`
 
@@ -218,7 +223,7 @@ V1 没有复制一套 agent 实现，而是用 [`agent_loop_tq.py`](https://gith
 
 ### 5.1 入口选择 V1
 
-[`main_ppo.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/main_ppo.py#L167) 根据 `trainer.use_v1` 选择 `TaskRunnerV1`。当前默认值在 [`ppo_trainer.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/ppo_trainer.yaml#L221) 中是 `true`。
+[`main_ppo.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/main_ppo.py#L184-L193) 根据 `trainer.use_v1` 选择 `TaskRunnerV1`。当前默认值在 [`ppo_trainer.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/ppo_trainer.yaml#L221) 中是 `true`。
 
 ### 5.2 Trainer 先建 inference server，再建 Agent Loop manager
 
@@ -230,11 +235,11 @@ V1 trainer 初始化 [`LLMServerManager`](https://github.com/verl-project/verl/b
 
 ### 5.3 Prompt 先注册进 TransferQueue
 
-训练侧 [`_submit_batch_to_rollout()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1345)：
+训练侧 [`_submit_batch_to_rollout()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1345-L1361)：
 
 1. 用 `uid` 把 prompt 标记为 pending；
-2. 把 prompt 字段放入 TransferQueue；
-3. 调用 manager 的 `generate_sequences()`。
+2. 在非 `sync` 的异步 trainer mode 中，把 prompt 字段额外写入 TransferQueue，供 checkpoint recovery 使用；当前默认 `sync` mode 只写 key 和 pending tag，不在这一步持久化 prompt fields；
+3. 把原始 batch 直接交给 manager 的 `generate_sequences()`。
 
 ### 5.4 Manager 只负责下发
 
@@ -281,7 +286,7 @@ V1 trainer 初始化 [`LLMServerManager`](https://github.com/verl-project/verl/b
 | `rollout.n` | worker 内为每个 prompt 建 sessions | trainer 先把 batch interleave repeat |
 | 调度 | fire-and-forget，结果进入 TQ | 阻塞 gather，直接返回 `DataProto` |
 | trajectory 存储 | 变长/ragged | prompt 左 pad、response 右 pad |
-| 多 output agent | adapter 已预留支持 | 普通 postprocess 按单 output 处理 |
+| 多 output agent | TQ 存储/key/reward 主路径支持；teacher logprob 仍只处理 final output | 普通 postprocess 按单 output 处理 |
 | 消费方 | ReplayBuffer | 当前训练 step 直接 union 回 batch |
 
 V0 manager 的阻塞实现见 [`AgentLoopManager.generate_sequences()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L1223)，V0 trainer 的 repeat 与调用见 [`ray_trainer.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/ray_trainer.py#L1461)。
@@ -420,17 +425,17 @@ TP × DP × PP
 
 1. trajectory 第一次请求时选择 inflight 最少的 server；
 2. 缓存 `request_id → server_id`；
-3. 后续 turn 使用相同 `request_id`，因此仍到同一 replica；
+3. 后续 turn 使用相同 `request_id`；只要 LRU cache entry 尚未淘汰且对应 server 仍处于 active pool，就继续路由到同一 replica；
 4. 请求完成后 inflight counter 减一。
 
-sticky routing 有利于 inference engine 复用相同前缀的 KV cache。
+若 cache entry 已被淘汰，或 sticky server 已被动态移除，load balancer 会重新选择当前 inflight 最少的 server。因此这里是 **best-effort sticky routing**，有利于 inference engine 复用相同前缀的 KV cache，但不是 trajectory 生命周期内不可打破的硬绑定。
 
 一个细节是：
 
 - Agent Loop 的外层 `request_id` 用于 sticky routing；
 - [`LLMServerClient.generate()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L228) 给真正 server 的每个 turn 再生成新的 UUID。
 
-所以“同一 trajectory 固定在同一 replica”不等于“所有 turn 共用 backend request id”。
+所以即使在 sticky cache 命中的期间，“同一 trajectory 路由到同一 replica”也不等于“所有 turn 共用 backend request id”。
 
 ### 9.3 当前 wake/sleep 由谁控制
 
@@ -477,9 +482,9 @@ parser 为了执行工具，可能把它转成结构化 message：
 
 ### Continuous Token
 
-默认 `data.continuous_token.enable=false`。开启后，模型族专用 builder 会在合并 assistant 与 non-assistant turn 时同步修正 token 边界、`response_mask` 和 logprob 对齐。
+默认 `data.continuous_token.enable=false`。开启后，模型族专用 builder 会在合并 assistant 与 non-assistant turn 时同步修正 token 边界、`response_mask` 和 logprob 对齐。由 builder 插入的 boundary token 不是 policy 采样的 action，因此它们会得到 `response_mask=0` 和 logprob `0.0`，即使它们不是工具 observation。
 
-相关入口是 [`continuous_token_wiring.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tokenizer/continuous_token_wiring.py#L172)；默认配置见 [`legacy_data.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/data/legacy_data.yaml#L121)。当前 multimodal processor 路径会回退到 legacy 增量方式。
+builder factory 在 [`continuous_token_wiring.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tokenizer/continuous_token_wiring.py#L172)，mask/logprob 对齐逻辑在 [`continuous_token.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tokenizer/continuous_token.py#L300-L350)；默认配置见 [`legacy_data.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/data/legacy_data.yaml#L121)。当前 multimodal processor 路径会回退到 legacy 增量方式。
 
 ---
 
@@ -504,16 +509,16 @@ response_mask=  1...1 0...0 1...1
 
 ### 11.1 字段表
 
-| 字段 | 包含什么 | 工具/环境 observation 是否包含 | 是否直接作为 policy action |
+| 字段 | 包含什么 | observation / 非 action boundary 的取值或行为 | 是否直接作为 policy action |
 |---|---|---:|---:|
-| `prompt_ids` / `prompts` | 初始 chat template token | 初始 prompt 中已有的内容可能包含 | 否 |
-| `response_ids` / `responses` | 初始 prompt 之后的完整 trajectory | 是 | 由 mask 决定 |
-| `response_mask` | response 每个 token 的 action 标记 | observation 位置为 0 | 是 |
-| `input_ids` | <code>prompts &#124;&#124; responses</code> | 是 | 否，模型输入序列 |
-| `attention_mask` | 哪些位置是真实 token、哪些是 padding | 真实 observation 为 1 | 否 |
-| `loss_mask` | 训练 loss 的有效 action 位置 | observation 为 0 | 是 |
-| `position_ids` | 模型位置编码 | observation 也占位置 | 否 |
-| `rollout_log_probs` | rollout engine 生成时的 token logprob | observation 用 0 占位 | 由 response mask 消费 |
+| `prompt_ids` / `prompts` | 初始 chat template token | 若初始 prompt 已含这类内容，它们仍属于 prompt | 否 |
+| `response_ids` / `responses` | 初始 prompt 之后的完整 trajectory | token 本身会被保留 | 由 mask 决定 |
+| `response_mask` | response 每个 token 的 action 标记 | observation 位置为 0；CT 插入的 boundary token 也为 0 | 是 |
+| `input_ids` | <code>prompts &#124;&#124; responses</code> | token 本身会被保留 | 否，模型输入序列 |
+| `attention_mask` | 哪些位置是真实 token、哪些是 padding | 真实 observation/boundary 为 1 | 否 |
+| `loss_mask` | 训练 loss 的有效 action 位置 | observation 和 CT boundary 为 0 | 是 |
+| `position_ids` | 模型位置编码 | observation/boundary 也占位置 | 否 |
+| `rollout_log_probs` | rollout engine 生成时的 token logprob | observation 和 CT boundary 用 0 占位 | 由 response mask 消费 |
 
 ### 11.2 `attention_mask` 不等于 `response_mask`
 
@@ -531,9 +536,9 @@ response_mask           1              0               1            0
 
 `AgentLoopOutput` 本身没有独立 `loss_mask`。语义上，agentic PPO/GRPO 的 loss mask 就是 `response_mask`：
 
-- V1 TQ adapter 显式写入 `field["loss_mask"] = field["response_mask"]`，见 [`agent_loop_tq.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L183)；
+- V1 TQ adapter 显式写入 `field["loss_mask"] = field["response_mask"]`，见 [`agent_loop_tq.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L194-L200)；
 - V0 在 padding 转 no-padding 时再复制该 mask；
-- PPO/GRPO advantage 与 policy loss 也使用 response mask 排除 observation。
+- PPO/GRPO advantage 与 policy loss 也使用 response mask 排除 observation 和 CT boundary 位置。
 
 ### 11.4 Position ids
 
@@ -584,7 +589,7 @@ attention:     [ 0   0  1  1  1 | 1 1 1 0 0]
 
 ### 13.1 rollout logprob 如何产生
 
-Worker 把 `rollout.calculate_log_probs` 放进 generation sampling params，见 [`AgentLoopWorker.generate_sequences()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L602)。Inference backend 返回当前 turn 生成 token 的 logprob，例如 vLLM 路径见 [`vllm_async_server.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L648)。
+Worker 把 `rollout.calculate_log_probs` 放进 generation sampling params；当前 V1 adapter 的实现见 [`AgentLoopWorkerTQ.generate_sequences()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L63-L70)，V0 通用 worker 也有同样逻辑。Inference backend 返回当前 turn 生成 token 的 logprob，例如 vLLM 路径见 [`vllm_async_server.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L648-L651)。
 
 多轮 Agent Loop 会：
 
@@ -592,13 +597,24 @@ Worker 把 `rollout.calculate_log_probs` 放进 generation sampling params，见
 - 给 observation token 追加 `0.0` 占位；
 - 最终与 `response_ids` 等长。
 
-这些 observation 位置不会参与 ratio/KL，因为 `response_mask=0`。
+这些 observation 位置不会参与 ratio/KL，因为 `response_mask=0`。Continuous Token 插入的 boundary token 同样使用 `0.0` 占位和 `response_mask=0`。
 
 ### 13.2 为什么还要重算 `old_log_probs`
 
 rollout engine 与 training engine 可能在 kernel、数值精度、并行策略上不同。标准 PPO 路径通常让 actor 对完整 trajectory 再计算一次 `old_log_probs`。rollout correction/bypass 等高级模式才会显式比较或直接使用 `rollout_log_probs`。
 
 所以不要把“配置了 rollout logprob”理解为“训练一定不再前向重算旧 policy 概率”。
+
+### 13.3 `AgentLoopMetrics` 在 V0 与 V1 中的去向
+
+当前 [`AgentLoopMetrics`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L81-L87) 有四个字段：
+
+- `generate_sequences`：所有 inference turn 的累计耗时；
+- `tool_calls`：所有工具执行阶段的累计耗时；
+- `compute_score`：worker-side async reward 的耗时；
+- `num_preempted`：backend 报告的 preemption 次数，`-1` 表示 unavailable。
+
+[`simple_timer`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/profiler/performance.py#L145-L168) 对同名字段做累加，所以多轮 agent 的前两个时间不是单独某一轮的耗时。[V0 manager](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L1249-L1287) 会把这些 per-trajectory metrics 汇总成 min/max/mean 和 slowest-sample timing；V1 TQ adapter 则把 `metrics` 随每个 trajectory field 写入 TransferQueue，但 [`AgentLoopManagerTQ.generate_sequences()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L243-L257) 只负责 dispatch，不调用 V0 的 `_performance_metrics()`。因此在这个快照中，不应期待 V1 自动产出与 V0 完全相同的 `agent_loop/*` timing 汇总。
 
 ---
 
@@ -657,7 +673,7 @@ response budget = assistant turn 1
 
 ## 16. 写一个最小自定义 Agent Loop
 
-下面实现一个仅适用于 text-only prompt 的 single-turn 变体。重点不是功能，而是展示正确接口；VLM 还要像内置 `SingleTurnAgentLoop` 一样处理 image/video/audio 与 processor kwargs。
+下面实现一个仅适用于 text-only prompt 的 legacy-token、single-turn 变体。为了让最小示例保持紧凑，它假定 `data.continuous_token.enable=false` 且 `actor_rollout_ref.rollout.full_determinism=false`。若启用 Continuous Token，应像内置 `SingleTurnAgentLoop` 一样调用 `ct_build_initial_tokens()` / `ct_merge_assistant_token()`；若启用 full determinism，还应接收 per-sample `priority` 并据此构造 deterministic request id。VLM 还要额外处理 image/video/audio 与 processor kwargs。
 
 ```python
 # my_package/my_agent_loop.py
@@ -688,7 +704,11 @@ class MySingleTurnLoop(AgentLoopBase):
                 sampling_params=sampling_params,
             )
 
-        metrics["num_preempted"] = token_output.num_preempted or 0
+        metrics["num_preempted"] = (
+            token_output.num_preempted
+            if token_output.num_preempted is not None
+            else -1
+        )
         response_ids = token_output.token_ids[: self.rollout_config.response_length]
 
         return AgentLoopOutput(
@@ -729,12 +749,13 @@ Worker 启动时加载 YAML 并写入 registry，见 [`AgentLoopWorker.__init__(
 ### 自定义 loop 必须满足的约束
 
 1. Python module 在每个 Ray worker 节点都能 import；
-2. `run()` 接受 `sampling_params` 和 dataset kwargs；
+2. `run()` 接受 `sampling_params` 和 dataset/framework kwargs；
 3. policy-generated token 与 `response_mask=1` 对齐；
-4. environment-injected token 与 `response_mask=0` 对齐；
+4. environment-injected token 以及 CT 插入的 boundary token 与 `response_mask=0` 对齐；
 5. `response_ids`、`response_mask`、非空 `response_logprobs` 长度一致；
 6. 不要通过“最终 messages 全量重编码”伪造 trajectory；
-7. 自定义 `__init__` 时应接收并向父类转发框架注入的 kwargs。
+7. 自定义 `__init__` 时应接收并向父类转发框架注入的 kwargs；
+8. `AgentLoopOutput` 必须提供 `metrics`，未知的 preemption 状态用 `num_preempted=-1`，不要伪装成 0 次。
 
 ---
 

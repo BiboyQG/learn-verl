@@ -12,7 +12,7 @@ verl 同时包含五种不同性质的代码：
 
 如果一开始按目录逐文件阅读，很容易把这些层混在一起。例如：
 
-- `ActorRolloutRefWorker` 不是 RL 里的 actor 定义，而是一个可以承载多个角色的远程 worker；
+- `ActorRolloutRefWorker` 不是 RL 里的 actor 定义，而是一个可承载多个角色的 inner worker；默认 V1 模型 worker group 中，[远程 `WorkerDict` 会在自己的 Ray actor 进程内实例化它](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L1008-L1028)；
 - rollout 不是一次普通的 model forward，而是采样、服务路由、Agent Loop 和环境交互的组合；
 - `DataProto` 不是算法本身，它是数据容器；
 - TransferQueue 不计算 loss，它负责让大数据不必通过 controller 反复搬运；
@@ -32,8 +32,10 @@ flowchart TB
     L6["第 6 层：RL 数学<br/>Advantage / Policy Loss / Value Loss / KL"]
 
     L1 --> L2 --> L3 --> L4 --> L5 --> L6
-    L6 -."新权重".-> L5
+    L6 -."loss / 优化目标".-> L5
 ```
+
+RL 数学层定义优化目标；[training engine 执行 actor update](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1672-L1705) 后才产生新参数，再由权重同步路径把 actor 参数交给 rollout。
 
 每层只回答一种问题：
 
@@ -77,7 +79,7 @@ old_log_probs = (
     if not bypass_recomputing_logprobs
     else trajectories.rollout_log_probs
 )
-ref_log_probs = reference.log_prob(trajectories)  # 仅在配置需要时
+ref_log_prob = reference.log_prob(trajectories)   # 仅在配置需要时
 values = critic.value(trajectories)               # GAE 等方法需要
 
 advantages, returns = estimate_advantage(
@@ -86,7 +88,7 @@ advantages, returns = estimate_advantage(
 
 critic.update(trajectories, returns)               # 没有 critic 时跳过
 if global_step >= critic_warmup:                   # warmup 阶段可以只更新 critic
-    actor.update(trajectories, old_log_probs, ref_log_probs, advantages)
+    actor.update(trajectories, old_log_probs, ref_log_prob, advantages)
 
 sync_actor_weights_to_rollout()
 ```

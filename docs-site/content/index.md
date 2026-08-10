@@ -19,7 +19,7 @@
 | verl 版本 | `0.9.0.dev` |
 | Git commit | `d33ddd7140f44d392e0e10b48a8902651a1340f4` |
 | 默认 trainer | V1，`trainer.use_v1=true` |
-| 默认 model engine | `dp`，通常对应 FSDP 路径 |
+| 默认 `model_engine` 配置组 | `dp`；本快照的 actor strategy 为 `fsdp` |
 
 verl 正在快速演进。阅读其他文章时，先判断它讲的是当前 V1 trainer，还是仍以 `RayPPOTrainer`、`DataProto` 为主干的 V0。两者的高层 RL 过程类似，但控制流和数据搬运方式明显不同。
 
@@ -133,7 +133,7 @@ flowchart LR
 - **等价伪代码**：用于解释控制流，不保证可直接运行；
 - **配置示例**：展示 Hydra override 的表达方式，需要按实际模型和集群修改路径。
 
-每章末尾都给出当前仓库中的源码入口。遇到文档与源码不一致时，以当前 checkout 的源码和配置 schema 为准。
+多数技术章节都给出当前仓库中的源码入口；学习地图和前置知识章则以路线、自测为主。遇到文档与源码不一致时，以当前 checkout 的源码和配置 schema 为准。
 
 ## 学习目标自测
 

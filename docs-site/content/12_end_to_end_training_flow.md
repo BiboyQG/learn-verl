@@ -256,8 +256,8 @@ update_actor()          → actor.train_mini_batch()
 V0 常把一个完整、已 padding 的 `DataProto` 交给 controller。V1 的主要做法不同：
 
 1. trajectory 的实际字段放在 TransferQueue 中；
-2. controller 和 worker RPC 之间大量传递轻量的 `KVBatchMeta`；
-3. worker 收到 meta 后，框架自动按 keys 取出它需要的 TensorDict 字段；
+2. controller 持有轻量的 `KVBatchMeta`，dispatch 层先把它转换为按 DP rank 分片的 `BatchMeta`，再通过 RPC 发送；
+3. worker 收到 `BatchMeta` 后，TQ bridge 自动取出它需要的字段并物化为 `TensorDict`；
 4. worker 输出的新字段再写回相同 keys。
 
 一个 `KVBatchMeta` 可以近似理解为：
@@ -280,7 +280,7 @@ KVBatchMeta(
 self.actor_rollout_wg.update_actor(batch)  # batch 是 KVBatchMeta
 ```
 
-而 worker 方法签名里看到 `TensorDict`，并不矛盾；dispatch 层先把 meta 按 DP rank 分片，bridge 再在 worker 的 RPC 边界完成取数和回写。分片与 collect 逻辑见 [`protocol.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/protocol.py#L1271-L1321)。
+而 worker 方法签名里看到 `TensorDict`，并不矛盾。完整转换链是：controller 侧的 `KVBatchMeta` → RPC 载荷中的分 rank `BatchMeta` → worker 侧的 `TensorDict`。若 worker 返回需要写回 TQ 的 batch-aligned `TensorDict`，collect 才会把各 rank 的 `BatchMeta` 合并并转回 `KVBatchMeta`；`update_actor` 这类只返回 batchless metrics 的调用不走这条回程。分片与 collect 逻辑见 [`protocol.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/protocol.py#L1271-L1321)。
 
 ### 6.1 为什么要保存变长张量
 
@@ -400,9 +400,11 @@ sequenceDiagram
     TQ-->>Trainer: KVBatchMeta(keys=6)
     Trainer->>Rollout: sleep, discard weights/KV cache
     Trainer->>Worker: compute old_log_probs(meta)
-    Worker-->>TQ: old_log_probs, entropy
+    Worker-->>TQ: log_probs, entropy
+    Trainer->>TQ: read/slice log_probs, put old_log_probs
     Trainer->>Worker: compute ref_log_prob(meta)
-    Worker-->>TQ: ref_log_prob
+    Worker-->>TQ: log_probs
+    Trainer->>TQ: read/slice log_probs, put ref_log_prob
     Trainer->>TQ: get reward/logprob fields and pad
     Trainer->>Trainer: group-relative advantage
     Trainer-->>TQ: advantages, returns
@@ -684,26 +686,38 @@ actor_rollout_ref.actor.use_kl_loss=true
 
 ### 9.13 阶段 K：actor update
 
-`_update_actor()` 把 `KVBatchMeta` 发给 actor worker。TQ bridge 在 worker 侧读取训练字段，worker 再执行 PPO epochs、mini-batch、micro-batch 和反向传播。入口见 [`_update_actor()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1672-L1711) 与 [`ActorRolloutRefWorker.update_actor()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L702-L707)。
+`_update_actor()` 在 controller 侧把 `KVBatchMeta` 交给 actor worker group 调用。dispatch 层把它转换为按 rank 分片的 `BatchMeta`，TQ bridge 再在 worker 侧物化训练字段；worker 随后执行 PPO epochs、mini-batch、micro-batch 和反向传播。入口见 [`_update_actor()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1672-L1711) 与 [`ActorRolloutRefWorker.update_actor()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py#L702-L707)。
 
-默认 `policy_loss.loss_mode=vanilla`，因此即使 advantage 来自 GRPO，policy loss 仍是 PPO clipped objective：
+默认 `policy_loss.loss_mode=vanilla`。即使 advantage 来自 GRPO，policy loss 的普通 PPO clipped core 仍是：
 
 ```text
-ratio_t = exp(log π_theta(a_t|s_t) - old_log_probs_t)
+r_t = exp(log π_theta(a_t|s_t) - old_log_probs_t)
 
-L_pg = -min(
-    ratio_t * A_t,
-    clip(ratio_t, 1-epsilon, 1+epsilon) * A_t
+L_clip,t = min(
+    r_t * A_t,
+    clip(r_t, 1-epsilon_low, 1+epsilon_high) * A_t
 )
 ```
 
-再按配置加入 entropy 和 KL：
+但这还不是默认实现的完整 objective。默认 `clip_ratio_c=3.0`，因此负 advantage 还会进入 dual-clip 分支：
 
 ```text
-L_actor = L_pg - entropy_coef * entropy + kl_coef * KL(actor || ref)
+L_dual,t = L_clip,t                         if A_t >= 0
+L_dual,t = max(L_clip,t, C_clip * A_t)      if A_t < 0
+
+C_clip = 3.0
+L_pg = -masked_mean(L_dual,t, response_mask)
 ```
 
-实现见 [`ppo_loss()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L57-L144) 和 [`compute_policy_loss_vanilla()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L1283-L1374)。loss 只使用 `response_mask=1` 的 token；prompt、tool observation 和 padding 不产生 policy-gradient loss。
+其中 `r_t` 是当前策略与旧策略在 token `t` 上的概率比，`A_t` 是该 token 的 advantage；`epsilon_low` 和 `epsilon_high` 分别控制 ratio 的下、上裁剪边界；`C_clip > 1` 是只作用于负 advantage 的额外阈值。`L_clip,t` 与 `L_dual,t` 写成待最大化的 token objective，代码中的 `L_pg` 则是它在有效 response token 上取平均后的负值，供优化器最小化。
+
+最后再按配置加入 entropy 和 KL：
+
+```text
+L_actor = L_pg - entropy_coeff * entropy + kl_loss_coef * KL(actor || ref)
+```
+
+这里的 `entropy_coeff` 和 `kl_loss_coef` 是实际 Hydra 字段名；后者只在 `use_kl_loss=true` 时参与 actor loss。clip、entropy 与 KL 的默认值见 [`actor.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/actor/actor.yaml#L35-L116)，实现见 [`ppo_loss()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L57-L144) 和 [`compute_policy_loss_vanilla()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L1283-L1374)；更完整的符号推导见[第 11 章的 asymmetric clip 与 dual clip](11_policy_and_value_update.md)。loss 只使用 `response_mask=1` 的 token；prompt、tool observation 和 padding 不产生 policy-gradient loss。
 
 ### 9.14 阶段 L：actor 权重同步回 rollout
 
@@ -915,7 +929,7 @@ trainer_sync.py::PPOTrainerSync.on_step_end
 
 1. 当前默认入口是 `TaskRunnerV1 → PPOTrainerSync`，不是 legacy `RayPPOTrainer`。
 2. GRPO 与 PPO 共用 trainer 基础设施；主要变化是 advantage estimator，典型 GRPO 不需要 critic。
-3. V1 trajectory 的真实字段存放在 TransferQueue，controller/worker 之间大量传递 `KVBatchMeta`。
+3. V1 trajectory 的真实字段存放在 TransferQueue；数据载体依次是 controller 侧的 `KVBatchMeta`、RPC 中的分 rank `BatchMeta` 和 worker 侧的 `TensorDict`。
 4. `P=2, n=3` 先提交 2 个 prompt group，再产生 6 条 trajectory；ReplayBuffer 的 batch size 与 trajectory row 数不是同一个概念。
 5. reward、old/ref logprob 和 group-relative advantage 都沿相同 TQ keys 逐步“长出”新字段，actor worker 最后读取这些字段做 PPO clipped update。
 6. sync trainer 每步更新结束后把 actor 权重同步给 rollout，下一轮采样才使用新 policy。

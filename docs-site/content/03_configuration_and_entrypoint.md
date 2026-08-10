@@ -339,6 +339,7 @@ return (
 ref 配置有一个容易困惑的实现细节：DP ref 的 `_target_` 也是 `FSDPActorConfig`。worker 在转换前，会把 ref 的：
 
 ```text
+log_prob_micro_batch_size
 log_prob_micro_batch_size_per_gpu
 log_prob_use_dynamic_bsz
 log_prob_max_token_len_per_gpu
@@ -482,15 +483,23 @@ OmegaConf.resolve(config)
 
 ## 3.6 `_target_`：从配置子树到 Python 对象
 
-转换函数位于 [verl/utils/config.py](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/config.py)：
+转换函数位于 [verl/utils/config.py](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/config.py)。下面是保留两条主路径的简化摘录；原函数还处理空配置、已经实例化的对象、普通 `dict` 和类型检查：
 
 ```python
 def omega_conf_to_dataclass(config, dataclass_type=None):
+    if not config:
+        return dataclass_type if dataclass_type is None else dataclass_type()
+    if not isinstance(config, (DictConfig, ListConfig, dict, list)):
+        return config
+
     if dataclass_type is None:
         assert "_target_" in config
         from hydra.utils import instantiate
         return instantiate(config, _convert_="partial")
 
+    if not is_dataclass(dataclass_type):
+        raise ValueError(...)
+    config = OmegaConf.create(config)
     cfg_from_dataclass = OmegaConf.structured(dataclass_type)
     cfg_merged = OmegaConf.merge(cfg_from_dataclass, config)
     return OmegaConf.to_object(cfg_merged)
@@ -751,8 +760,8 @@ flowchart TD
     C --> D["auto_set_device + validate_config"]
     D --> E["run_ppo: 初始化 Ray"]
     E --> F["创建远端 TaskRunnerV1"]
-    F --> G["解析 OmegaConf 插值并初始化 TransferQueue"]
-    G --> H["选择 V1 trainer class"]
+    F --> G["选择 V1 trainer class"]
+    G --> H["解析 OmegaConf 插值并初始化 TransferQueue"]
     H --> I["trainer.init(): tokenizer、data、resource pools、workers"]
     I --> J["创建 AgentLoopManager"]
     J --> K["trainer.fit(agent_loop_manager)"]
@@ -791,7 +800,7 @@ flowchart TD
 5. `trainer.init()`；
 6. 创建 AgentLoopManager；
 7. `trainer.fit(agent_loop_manager)`；
-8. 无论成功或异常，都结束 tracking 并关闭 TransferQueue。
+8. `tq.init()` 成功进入 `try` 后，无论 trainer 构造、初始化或训练成功与否都会关闭 TransferQueue；只有 logger 已经创建时才结束 tracking。trainer class 选择、配置 resolve 或 `tq.init()` 自身抛出的异常不在这个 `finally` 的保护范围内。
 
 如果配置了：
 
@@ -814,8 +823,9 @@ actor_rollout_ref.rollout.agent.agent_loop_manager_class
 5. 需要时准备 critic worker；
 6. 初始化 actor、ref 和 critic model engine；
 7. 初始化 reward loop manager；
-8. 初始化 rollout LLM server manager；
-9. 初始化 checkpoint engine manager，并加载 checkpoint。
+8. 若启用 distillation，初始化 `MultiTeacherModelManager` 并转换 `DistillationConfig`；
+9. 初始化 rollout LLM server manager；
+10. 初始化 checkpoint engine manager，并加载 checkpoint。
 
 actor/ref/rollout 具体在 [verl/workers/engine_workers.py](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine_workers.py) 中按需转成 dataclass，并据此创建训练或推理 engine。
 
@@ -838,10 +848,10 @@ actor/ref/rollout 具体在 [verl/workers/engine_workers.py](https://github.com/
 
 - 在非 dynamic batch 路径中，总 GPU 数与 Megatron TP/PP/CP 的整除关系；
 - 在非 dynamic batch 路径中，`data.train_batch_size × rollout.n` 与最小 batch 粒度是否兼容；
-- actor mini/micro batch 关系；
-- ref、rollout log-prob 的旧 global micro-batch 与新 per-GPU 字段互斥；
-- critic 在需要时的 batch 关系；
-- validation sampling 的 temperature；
+- 当 `actor.use_dynamic_bsz=false` 时，检查 actor mini/micro batch 关系；
+- 当 `actor.use_dynamic_bsz=false` 时，检查 ref、rollout log-prob 的旧 global micro-batch 与新 per-GPU 字段互斥；
+- 当 critic 启用且 `critic.use_dynamic_bsz=false` 时，检查 critic 的 batch 关系；
+- 当 `actor_rollout_ref.rollout.val_kwargs.do_sample=true` 时，检查的是共享的 `actor_rollout_ref.rollout.temperature > 0`；当前入口并不检查 `val_kwargs.temperature`；
 - vLLM 的 LoRA rank 是否受支持。
 
 ### 第三关：dataclass 的 `__post_init__()` 和 `validate()`

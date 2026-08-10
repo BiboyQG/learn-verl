@@ -14,13 +14,15 @@
 [151644, 872, 25, 220, 16, 22, ...]
 ```
 
+这里的 token ID 只用于说明“文本会被离散化”，并不对应一个承诺的模型输出；具体数字会随 model、tokenizer 和 chat template 改变。
+
 设词表大小为 `V`，一条长度为 `L` 的序列通常有：
 
 - `input_ids`: `[L]`
 - batch 后的 `input_ids`: `[B, L]`
 - 模型输出 logits: `[B, L, V]`
 
-chat template 还会插入角色标记、消息边界和工具 schema。对于当前 V1 Agent Loop，dataset 主要提供 `raw_prompt`；真正的 chat-template/tokenization 位于 rollout/Agent Loop 一侧，而不是假定 dataset 已经给出最终 `input_ids`。
+chat template 还会插入角色标记、消息边界和工具 schema。对于当前 V1 Agent Loop，dataset 主要提供 `raw_prompt`；真正的 chat-template/tokenization 位于 rollout/Agent Loop 一侧，而不是假定 dataset 已经给出最终 `input_ids`。trainer 也会从 [actor model config 初始化 tokenizer/processor](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L646-L659)，因此不要把上面的 ID 当成跨实验常量。
 
 ### Logits、概率与 log-prob
 
@@ -99,7 +101,7 @@ $$
 - **reference policy**：通常是冻结的 SFT 模型，用于 KL 约束；
 - **current policy**：正在反向传播的 actor。
 
-理想 on-policy PPO 中 rollout 与 old 是同一个策略。当前 V1 默认 decoupled 路径会让 training actor 在更新前重算 `old_log_probs`；名义权重可能相同，但它仍不等于 rollout backend 当时记录的行为概率。只有 bypass 路径才直接令 `old_log_probs = rollout_log_probs`。
+理想 on-policy PPO 中 rollout 与 old 是同一个策略。当前 V1 [默认关闭 bypass mode](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/algorithm/rollout_correction.yaml#L19-L20)，因此 training actor 会在更新前重算 `old_log_probs`。它与 rollout backend 记录的行为概率在概念和来源上仍需区分；即使名义权重相同，跨 backend 的数值也不保证完全一致。只有 bypass 路径才直接令 `old_log_probs = rollout_log_probs`。两条路径可直接对照 [`_compute_old_log_prob()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1479-L1515)。
 
 ### Prompt 与 Response
 
@@ -265,10 +267,10 @@ $$
 其中：
 
 ```text
-r_t = exp(current_log_prob - old_log_prob)
+r_t = exp(clamp(current_log_prob - old_log_prob, -20, 20))
 ```
 
-当更新把 token 概率推得过远时，clip 会截住该样本继续改善 surrogate objective 的激励。它不是对参数或最终 ratio 的硬投影，不能保证训练后所有 ratio 都落在 `[1-ε,1+ε]`。实现里通常最小化负目标，因此代码中的 `pg_loss` 符号可能与论文最大化目标相反；当前默认 vanilla loss 对负 advantage 还支持 dual-clip 扩展，后文会单独解释。
+数学定义是 `exp(current-old)`；上面展示的是 verl 的数值实现，它先把 log-ratio 裁到 `[-20,20]` 再取指数，避免指数溢出，也会让超出区间的实现 ratio 饱和。随后 PPO 的 ratio clip 会截住该样本继续改善 surrogate objective 的激励。它不是对参数或最终 ratio 的硬投影，不能保证训练后所有 ratio 都落在 `[1-ε,1+ε]`。实现里通常最小化负目标，因此代码中的 `pg_loss` 符号可能与论文最大化目标相反；当前默认 vanilla loss 对负 advantage 还支持 dual-clip 扩展，后文会单独解释。对应实现见 [`compute_policy_loss_vanilla()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L1320-L1359)。
 
 PPO 常搭配：
 
@@ -327,11 +329,12 @@ for t in reversed(range(response_length)):
     # mask=0 的 observation/padding 不作为 action step：保持递推状态，不重置它
     last_gae = where(response_mask[t], candidate, last_gae)
     next_value = where(response_mask[t], value[t], next_value)
-    advantage[t] = last_gae
-return_ = advantage + value
+    raw_advantage[t] = last_gae
+return_ = raw_advantage + value
+advantage = masked_whiten(raw_advantage, response_mask)
 ```
 
-这段仍是简化伪代码。Tool Agent 的 observation token 具有 `response_mask=0`，但不代表 episode 在那里终止；当前实现跳过 observation 的 value/TD-error，同时保留 `next_value` 和 `last_gae`，从而连接 observation 两侧相邻的模型 action。下游 loss 仍只消费 mask 有效的位置。
+这段仍是简化伪代码。`return_` 使用 whitening 之前的 `raw_advantage`，而交给 actor 的 `advantage` 会在所有有效 action token 上做 masked whitening；二者不能互换。Tool Agent 的 observation token 具有 `response_mask=0`，但不代表 episode 在那里终止；当前实现跳过 observation 的 value/TD-error，同时保留 `next_value` 和 `last_gae`，从而连接 observation 两侧相邻的模型 action。whitening 只用 mask 内元素计算统计量，下游 loss 也只消费 mask 有效的位置。完整顺序见 [`compute_gae_advantage_return()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L238-L263)。
 
 ## 1.5 GRPO：用组内相对表现代替 learned critic
 
@@ -396,6 +399,8 @@ $$
 1. **KL in reward**：从 token reward 中减去 KL penalty，再估 advantage；
 2. **KL loss**：policy loss 之外另加 KL 项。
 
+理想公式的期望分布是 `a ~ πθ`，但一批真实 token 是由 rollout/behavior policy 采出来的。当前 reward-side 路径计算 [`old_log_probs` 与 `ref_log_prob` 的 sampled penalty](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/ray_trainer.py#L94-L109)，loss-side 路径才计算 [`current log_prob` 与 `ref_log_prob`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L120-L142)。只有当相应被比较策略也是采样分布，并使用匹配的 estimator 时，样本均值才可直接解释为上面方向的严格 KL；在 decoupled/off-policy 情形下，更准确的叫法是 sampled KL penalty/estimator。
+
 配置决定 reference worker 是否必要，不能简单认为“所有 PPO/GRPO 都必然启动 ref”。
 
 ## 1.7 On-policy、off-policy 与 staleness
@@ -428,7 +433,7 @@ trainer 已更新到 θ_{k+2}
 
 ### Data Parallel
 
-每个 rank 处理不同数据。朴素 DP 每张 GPU 都持有完整参数；FSDP/ZeRO 则把参数、梯度和 optimizer state 分片，降低单卡显存。
+每个 rank 处理不同数据。朴素 DP 每张 GPU 都持有完整参数；FSDP，以及不同 stage 的 ZeRO，会分片其中一部分或全部参数、梯度和 optimizer state，从而降低单卡显存。
 
 ### Tensor Parallel
 
@@ -458,6 +463,8 @@ Rollout engine:  generation throughput + KV cache + request scheduling
 Ray actor 可以理解成带状态的远程 Python 进程：
 
 ```python
+import ray
+
 @ray.remote(num_gpus=1)
 class Worker:
     def compute(self, x):
@@ -470,7 +477,7 @@ result = ray.get(future)
 
 在 verl 中：
 
-- driver/controller 决定调用顺序；
+- launcher/Ray driver 负责启动并等待 controller；controller 决定训练阶段的调用顺序；
 - remote worker 持有模型、optimizer 或 rollout server；
 - resource pool / placement group 决定它们放到哪些节点和 GPU；
 - worker group 把一次逻辑调用分发给多个 rank。
@@ -501,7 +508,7 @@ python3 -m verl.trainer.main_ppo \
 
 ## 1.11 前置知识自测
 
-1. `old_log_prob` 与 `ref_log_prob` 为什么不能互换？
+1. `old_log_probs` 与 `ref_log_prob` 为什么不能互换？
 2. 工具 observation 为什么 `attention_mask=1`，但 `response_mask=0`？
 3. GRPO 的 group 是按 batch 随意分组，还是按原始 prompt 分组？
 4. Ray placement 与 FSDP collective 各自负责什么？

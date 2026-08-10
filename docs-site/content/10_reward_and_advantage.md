@@ -39,7 +39,7 @@ prompt
 
 工具返回也必须进入模型上下文，否则下一轮 assistant 看不到它；但工具返回不是模型采样的动作，因此不应训练模型去“生成”这些 token。
 
-verl 用 `response_mask` 区分二者。`AgentLoopOutput` 明确定义了：模型生成 token 为 1，tool response token 为 0，见
+verl 在 Agent Loop 输出阶段用 `response_mask` 区分二者。`AgentLoopOutput` 明确定义了：模型生成 token 为 1，tool response token 为 0，见
 [`agent_loop.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L90-L108)。
 
 一个简化序列可以写成：
@@ -51,7 +51,7 @@ response_mask:   1 1 1 1 1 1       0 0 0 0          1 1 1 1        0 0
 ```
 
 对应实现可直接看
-[`AgentLoopManager.generate_sequences`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L581-L600) 和
+[`AgentLoopWorker.generate_sequences`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L581-L600) 和
 [`ToolAgentLoop`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L262-L280)。工具 observation 被追加时，mask 被追加为 0，见
 [`tool_agent_loop.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L433-L449)。
 
@@ -60,13 +60,19 @@ response_mask:   1 1 1 1 1 1       0 0 0 0          1 1 1 1        0 0
 | 字段 | 典型 shape | 1 代表什么 | 主要用途 |
 |---|---:|---|---|
 | `attention_mask` | `[B, prompt_len + response_len]` | 是真实 token，不是 padding | Transformer attention |
-| `response_mask` | `[B, response_len]` | 是 actor 生成的 response token | policy/KL/entropy/advantage 的有效位置 |
-| `loss_mask` | 通常与 `response_mask` 相同 | 需要反向传播的 token | engine 内部 loss 计算 |
+| `response_mask` | `[B, response_len]` | 初始值 1 表示 actor 生成 token；rollout rejection 后 1 表示仍被保留的 actor token | policy/KL/entropy/advantage 的有效位置 |
+| `loss_mask` | `[B, response_len]` | Agent Loop 写入时与原始 `response_mask` 相同 | engine 内部的 token 选择和全局 token 计数 |
 
 V1 Agent Loop 当前直接令 `loss_mask = response_mask`，见
-[`agent_loop_tq.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L177-L203)。因此：
+[`agent_loop_tq.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L177-L203)。这是**写入 TransferQueue 时的初始相等关系**，不是整个 step 内永远相等。V1 先用原始 `response_mask` 做 trainer-level KL reward shaping，然后 rollout correction 可以执行 rejection、改写 `response_mask`，最后优势估计器才读取改写后的 mask；相应时序见
+[`trainer_base.py::_compute_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1598-L1645)，实际覆盖操作见
+[`rollout_corr_helper.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/rollout_corr_helper.py#L1049-L1061)。原始 `loss_mask` 不随这一步更新。
 
-> 工具 observation 虽然参与前向计算、改变后续状态，但其位置不会产生 policy loss。
+因此无 rejection 时两者相同；启用 rejection 后，某个 assistant token 可以满足 `loss_mask == 1` 但 `response_mask == 0`。在当前 PPO 训练路径中，policy、entropy、actor-side KL 和 critic value loss 的**分子有效位置**都显式用 correction 后的 `response_mask` 选出，见
+[`workers/utils/losses.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L85-L137) 和
+[`workers/utils/losses.py::value_loss`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L179-L203)。`loss_mask` 仍可通过 engine 统计的 `batch_num_tokens` 影响 token-mean 等全局归一化分母；下一章会精确展开这一区别。因此：
+
+> 工具 observation 虽然参与前向计算、改变后续状态，但其位置不会产生 policy loss。rollout rejection 置零的 assistant token 同样不进入 loss 分子，但原始 `loss_mask` 仍可能把它计入 engine 的全局 token 分母。
 
 ---
 
@@ -77,12 +83,13 @@ V1 Agent Loop 当前直接令 `loss_mask = response_mask`，见
 | 字段 | shape | 含义 |
 |---|---:|---|
 | `responses` | `[B, T]` | assistant token、tool observation 和 padding |
-| `response_mask` | `[B, T]` | 只选中 assistant 生成 token |
-| `rm_scores` | `[B, T]` | reward manager 产生的逐 token 原始分数 |
-| `token_level_scores` | `[B, T]` | trainer 对 `rm_scores` 的统一命名 |
-| `token_level_rewards` | `[B, T]` | 可选 KL reward shaping 之后的奖励 |
+| `response_mask` | `[B, T]` | Agent Loop 初始只选中 assistant token；rollout correction 后只选中未被 rejection 去掉的 assistant token |
+| `loss_mask` | `[B, T]` | 保留 Agent Loop 的原始 assistant-token mask，主要供 engine 选择/计数 |
+| `rm_scores` | `[B, T]` | reward manager 输出的逐 token 分数；可能已包含 DAPO overlong 等 manager-side shaping |
+| `token_level_scores` | `[B, T]` | trainer 对 `rm_scores` 的统一命名，数值直接复制 |
+| `token_level_rewards` | `[B, T]` | trainer-side 可选 KL reward shaping 之后的奖励 |
 | `values` | `[B, T]` | critic 在每个 response 位置的预测；GAE 才必需 |
-| `advantages` | `[B, T]` | actor 更新时每个动作的权重 |
+| `advantages` | `[B, T]` | actor 更新时每个 post-correction 保留动作的权重；其他位置由 mask 排除 |
 | `returns` | `[B, T]` | critic target，或为了统一接口保存的占位结果 |
 | `old_log_probs` | `[B, T]` | PPO 更新开始前的 actor log-probability |
 | `ref_log_prob` | `[B, T]` | 冻结 reference policy 的 log-probability |
@@ -98,14 +105,20 @@ AgentLoopOutput
     responses + response_mask
            |
            v
-reward function / reward model
+V1 RewardLoop
+  streaming Agent Loop / colocated post-sampling
            |
            v
-rm_scores == token_level_scores
+rm_scores                     # 可能已有 manager-side shaping
+    == token_level_scores
            |
            |  可选：减去 beta * KL(token)
            v
-token_level_rewards
+token_level_rewards + original response_mask
+           |
+           |  可选 rollout correction：只改 mask；已有 rewards 不清零
+           v
+token_level_rewards + post-correction response_mask
            |
            |  GAE / GRPO / RLOO / REINFORCE++ / ...
            v
@@ -114,20 +127,34 @@ advantages + returns
 
 ---
 
-## 3. 原始 score 怎样落到 token 上
+## 3. Reward manager 输出怎样落到 token 上
 
 ### 3.1 默认是稀疏的 terminal outcome reward
 
-常见数学题 reward function 只返回一个标量，例如正确为 1、错误为 0。verl 的普通 reward manager 会先创建全 0 的 `[B,T]` tensor，然后把这个标量放在最后一个有效 response 位置：
+常见数学题 reward function 只返回一个标量，例如正确为 1、错误为 0。当前 V1 trainer 总是初始化 `RewardLoopManager`，默认配置使用 8 个 registered `naive` reward worker，见
+[`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L326-L336) 和
+[`reward.yaml`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/reward/reward.yaml#L1-L20)。它有两条执行路径：
+
+1. **Streaming reward**：未启用 reward model 的 rule-based reward，或使用独立 resource pool 的 reward model，会把 reward worker handles 传给 Agent Loop；每个 session 在 rollout 内异步计分。
+2. **Colocated reward model**：reward model 开启但没有独立 resource pool 时，handles 为 `None`；trainer 在 replay-buffer sampling 之后成批计分。
+
+分支选择见
+[`RewardLoopManager.reward_loop_worker_handles`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_loop.py#L292-L302)；streaming 分支的计分见
+[`AgentLoopWorker._compute_score`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L961-L1023)，colocated 分支见
+[`trainer_base.py::_step_once`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L536-L553) 和
+[`trainer_base.py::_compute_reward_colocate`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1374-L1426)。
+
+两条路径最终都会产生稀疏 terminal `rm_scores`：先创建全 0 的 `[B,T]` tensor，再把标量分数放到最后一个有效 response 位置。等价的核心操作是：
 
 ```python
 reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
 reward_tensor[i, valid_response_length - 1] = reward
 ```
 
-真实实现见
-[`workers/reward_manager/naive.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/reward_manager/naive.py#L90-L175)。如果异步 reward 已经在 Agent Loop 中算完，`AgentLoopOutput.as_dict()` 也会生成 `rm_scores` 并把分数放到末尾，见
-[`agent_loop.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L116-L147)。
+colocated 分支的当前 V1 实现在
+[`RewardManagerBase.assemble_rm_scores`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_manager/base.py#L61-L82)；streaming 分支先由当前
+[`NaiveRewardManager.run_single`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_manager/naive.py#L34-L99) 算出标量，再由
+[`AgentLoopOutput.as_dict`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L116-L147) 把分数放到未 padding response 的末尾。`verl/workers/reward_manager/*` 是 legacy trainer 路径，不是这一章主讲的 V1 实现。
 
 例如一条长度为 5 的回答得分 1：
 
@@ -149,8 +176,12 @@ rm_scores = [0, 0, 0, 0, 1]
 }
 ```
 
-其中 `score` 是总奖励；其他键进入 `reward_extra_info`。GDPO 会按配置从这些独立 reward 维度计算 advantage，见
-[`compute_gdpo_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L361-L468)。
+其中 `score` 是写入 `rm_scores` 的总奖励；其他键进入 `reward_extra_info`。算法层的
+[`compute_gdpo_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L361-L468) 设计为按配置从这些独立 reward 维度计算 advantage。
+
+> **当前 V1 接线限制**：在本章固定的源码快照中，V1 `_compute_advantage` 只从 TransferQueue 取出 `uid`、`response_mask`、`rm_scores`、log-probability 和 `values`，没有把 `prompts`、`attention_mask` 或各 reward component 传给 GDPO，见
+> [`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1588-L1596)。而 GDPO 函数立即需要 `batch["prompts"]`、`batch["attention_mask"]` 和 `non_tensor_batch` 中的 component keys，见
+> [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L412-L433)。因此仅设置 `algorithm.adv_estimator=gdpo` 不能在当前默认 V1 数据路径端到端使用这些维度；需要自定义 V1 接线，或使用会携带这些字段的 legacy 路径。
 
 ### 3.3 tool reward 不会自动加到总 reward
 
@@ -176,12 +207,12 @@ $$
 
 **符号说明**：$r_{\text{final}}$ 是 shaping 后的最终奖励，$r_{\text{score}}$ 是原始评分；下标 `final` 和 `score` 只是帮助辨认用途。$L$ 是 response 段中 `attention_mask == 1` 的位置数：在 tool-agent 中既含 assistant token，也含 tool observation，但不含 padding，不能把它理解成 `response_mask` 选中的纯 assistant 长度。$L_{\text{buffer}}$ 对应 `overlong_buffer_cfg.len`，必须大于 0；$L_{\text{expected}}$ 等于 `max_resp_len` 减去 $L_{\text{buffer}}$，而源码还要求 `max_resp_len` 不小于 $L_{\text{buffer}}$，但不会进一步验证该配置值是否真的等于 rollout 的 response 容量。$c$ 对应 `penalty_factor`，按惩罚语义应为非负数。$L-L_{\text{expected}}$ 是超出的长度，前面的负号把它变成扣分；分数线表示用超出长度除以缓冲长度，`min` 是取最小值的算子，末尾的 0 保证这一项最多为 0、不会因长度较短而加分。
 
-实现位于
-[`workers/reward_manager/dapo.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/reward_manager/dapo.py#L119-L132)。这是 **reward shaping**：它在优势估计之前直接改变了 reward。
+当前 V1 实现位于
+[`experimental/reward_loop/reward_manager/dapo.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_manager/dapo.py#L32-L119)。这是 **manager-side reward shaping**：它在优势估计之前把 shaped `reward_score` 写入 `rm_scores`，所以后续的 `token_level_scores` 已经包含这项超长惩罚。
 
 ---
 
-## 4. KL reward shaping：`score` 与 `reward` 第一次分开
+## 4. Trainer-level KL reward shaping：`token_level_scores` 与 `token_level_rewards` 分开
 
 如果启用：
 
@@ -200,9 +231,11 @@ $$
 r_t = \mathrm{score}_t - \beta\,\widehat{D}_{KL,t},
 $$
 
-**公式含义**：第 $t$ 个 token 真正交给 RL 的奖励，是该位置的原始 score 减去“它偏离 reference policy 的程度”乘惩罚系数。
+**公式含义**：第 $t$ 个 token 真正交给 RL 的奖励，是该位置的 `token_level_scores` 加上 KL shaping 项 $-\beta\widehat{D}_{KL,t}$。对当前 `kl`/`k1` estimator，$\widehat{D}_{KL,t}$ 是带符号的单样本估计：它为正时该 token reward 减小，为负时减去负数、该 token reward 反而增大。因此这不是“每个 token 一律扣分”；惩罚性质只在满足采样条件后的期望意义上成立。
 
-**符号说明**：$t$ 是 token 位置；$r_t$ 是该位置 shaping 后的 reward；$\mathrm{score}_t$ 是该位置的 `token_level_scores`，使用直立英文 `score` 是为了避免与第 1 节表示状态的 $s_t$ 混淆；$\beta$（beta）是 KL controller 当前的非负系数，越大就越强地限制 old policy 偏离 reference policy。当前配置 `kl_penalty: kl` 精确计算 `old_log_probs - ref_log_prob`，所以 $\widehat{D}_{KL,t}$ 的方向是“old/proximal policy 减 reference policy”，不是反向；当动作确实采样自 old policy 时，其期望对应 forward KL，即 $D_{KL}(\pi_{\mathrm{old}}\|\pi_{\mathrm{ref}})$，双竖线表示从左侧分布到右侧分布的有向比较。$D_{KL}$ 表示 Kullback–Leibler divergence，上方的“帽子”表示它是单个已采样 token 的估计量而非完整分布求和，下标 `KL,t` 分别标出算子种类和 token 位置。单个 token 的估计值可能为负；若数据来自不同的 rollout policy 且没有相应 importance correction，样本均值也不能严格称为这个 old-to-reference KL。
+**符号说明**：$t$ 是 token 位置；$r_t$ 是该位置 shaping 后的 reward；$\mathrm{score}_t$ 是该位置的 `token_level_scores`，使用直立英文 `score` 是为了避免与第 1 节表示状态的 $s_t$ 混淆；$\beta$（beta）是 KL controller 的当前系数，按惩罚语义应配为非负数，且越大就越强地限制 old policy 偏离 reference policy。但当前 `KLControlConfig`、fixed controller 和 adaptive controller 都没有校验或 clamp 这个符号，见
+[`algorithm.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/algorithm.py#L24-L39) 和
+[`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L153-L181)；负值配置会破坏上述惩罚直觉。当前配置 `kl_penalty: kl` 精确计算 `old_log_probs - ref_log_prob`，所以 $\widehat{D}_{KL,t}$ 的方向是“old/proximal policy 减 reference policy”，不是反向；当动作确实采样自 old policy 时，其期望对应 forward KL，即 $D_{KL}(\pi_{\mathrm{old}}\|\pi_{\mathrm{ref}})$，双竖线表示从左侧分布到右侧分布的有向比较。$D_{KL}$ 表示 Kullback–Leibler divergence，上方的“帽子”表示它是单个已采样 token 的估计量而非完整分布求和，下标 `KL,t` 分别标出算子种类和 token 位置。单个 token 的估计值可能为负；若数据来自不同的 rollout policy 且没有相应 importance correction，样本均值也不能严格称为这个 old-to-reference KL。
 
 代码对应：
 
@@ -214,8 +247,10 @@ token_level_rewards = token_level_scores - beta * kld
 
 见 [`apply_kl_penalty`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/ray_trainer.py#L78-L117)。注意两点：
 
-1. KL shaping 只作用于 `response_mask == 1` 的 assistant token，工具 observation 不参与。对默认 `k1` estimator，单 token 的估计值可能为负，所以该位置的 reward 可能减小也可能增大；“惩罚”指满足 on-policy 采样条件后的期望意义。
+1. KL shaping 发生在 rollout correction 之前，所以这里使用的是 Agent Loop 写入的**原始** `response_mask`：它只选 assistant token，工具 observation 不参与。对默认 `k1` estimator，单 token 的估计值可能为负，所以该位置的 reward 可能减小也可能增大；“惩罚”指满足 on-policy 采样条件后的期望意义。
 2. terminal score 通常只在最后一个位置非零，但 KL penalty 可以分布在所有生成 token 上。
+
+随后若 rollout rejection 把某些 assistant 位置的 `response_mask` 改成 0，这些位置已经写入的 KL-shaped `token_level_rewards` 不会被就地清零；优势估计器如何处理它们，取决于各 estimator 是先对 reward 求和，还是按 correction 后的 mask 做递推。第 6、7、9 节会分别说明。
 
 例如：
 
@@ -226,6 +261,8 @@ beta              = 0.01
 token_level_rewards
                    = [-0.001, -0.002, 0.997]
 ```
+
+这个例子的三个 `kld` 都为正，所以三个位置都扣分。若某位置 `kld=-0.1`、`beta=0.01`，该位置的 shaping 项是 `-0.01 * (-0.1) = +0.001`，reward 会增大 `0.001`。
 
 KL 也可以直接加到 actor loss，而不改 reward。两种路径的差别在下一章说明。
 
@@ -255,7 +292,7 @@ $$
 
 **符号说明**：$\nabla_\theta$ 是“对参数 $\theta$ 求梯度”，即寻找让目标变化最快的参数方向；等号左侧 $\nabla_\theta J(\theta)$ 是整个目标的梯度。$\mathbb{E}$ 表示对采样轨迹取期望；$\sum_t$ 表示把所有生成时刻 $t$ 的项相加；$\log$ 是自然对数，它把 token 概率变成 log-probability；$\pi_\theta(a_t\mid s_t)$ 是在状态 $s_t$ 下选择动作 $a_t$ 的概率；$\nabla_\theta\log\pi_\theta(a_t\mid s_t)$ 是这个 log-probability 对参数的梯度；$A_t$ 是第 $t$ 个动作的 advantage，并与前面的梯度相乘。
 
-**等式成立条件**：这里写的是有限时域、on-policy、未折扣（或已把折扣权重吸收到 advantage 定义中）的理想 policy-gradient identity；轨迹需由 $\pi_\theta$ 采样，$A_t$ 需是真实 advantage 或条件无偏估计，环境转移与 reward 也不能有未计入的显式参数依赖。若用 return 减 baseline，baseline 在给定状态后不能依赖当前采样动作，否则减去它会改变期望梯度。实际 PPO 使用 old policy 数据、importance ratio、clipping 和近似/归一化 advantage，优化的是相应的 surrogate，并不是这个等式在每个 batch 上的精确实现；求和也只覆盖 `response_mask == 1` 的 actor 动作位置。
+**等式成立条件**：这里写的是有限时域、on-policy、未折扣（或已把折扣权重吸收到 advantage 定义中）的理想 policy-gradient identity；轨迹需由 $\pi_\theta$ 采样，$A_t$ 需是真实 advantage 或条件无偏估计，环境转移与 reward 也不能有未计入的显式参数依赖。若用 return 减 baseline，baseline 在给定状态后不能依赖当前采样动作，否则减去它会改变期望梯度。实际 PPO 使用 old policy 数据、importance ratio、clipping 和近似/归一化 advantage，优化的是相应的 surrogate，并不是这个等式在每个 batch 上的精确实现；求和也只覆盖当前 `response_mask == 1` 的 actor 动作位置。无 rollout rejection 时这就是全部 assistant 动作；启用 rejection 后只剩 correction 保留的 assistant 动作。
 
 直觉非常简单：
 
@@ -366,7 +403,7 @@ advantages_raw = [0.7365, 0.6700, 0.6000]
 returns        = [0.9365, 0.9700, 1.0000]
 ```
 
-verl 随后会在所有有效 token 上对 advantage 做 `masked_whiten`，所以真正写入 batch 的 `advantages` 会变成近似零均值、单位方差；`returns` 保留未 whiten 的 critic target。这里“白化”是先只用 mask 选中的 advantage 计算带 Bessel 校正的样本方差，再让每个有效值减去均值并除以“样本方差加 `1e-8` 后的平方根”；mask 为 0 的 observation 和 padding 不参与统计。第 9 节给出同一 helper 的精确公式和“全 batch 只有一个有效 token”时的异常边界。
+verl 随后会在所有有效 token 上对 advantage 做 `masked_whiten`，所以真正写入 batch 的 `advantages` 会变成近似零均值、单位方差；`returns` 保留未 whiten 的 critic target。这里“白化”是先只用 mask 选中的 advantage 计算带 Bessel 校正的样本方差，再让每个有效值减去均值并除以“样本方差加 `1e-8` 后的平方根”；correction 后 mask 为 0 的 observation、padding 和 rejected assistant token 都不参与统计。第 9 节给出同一 helper 的精确公式和“全 batch 只有一个有效 token”时的异常边界。
 
 ### 6.3 源码逐行对应
 
@@ -385,9 +422,9 @@ advantages = masked_whiten(advantages, response_mask)
 [`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263)。`masked_whiten` 使用 mask 内的样本方差，见
 [`torch_functional.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/torch_functional.py#L287-L339)。
 
-### 6.4 Tool Agent Loop 中的关键行为
+### 6.4 mask 中断位置的关键行为
 
-GAE 遇到 `response_mask == 0` 的 observation token 时，不更新 `nextvalues` 和 `lastgaelam`。因此它会**跳过 observation 位置，把前一轮 assistant 动作与后一轮 assistant 动作连接起来**。
+GAE 使用 rollout correction 之后的 `response_mask`。遇到 `response_mask == 0` 的位置时，它不更新 `nextvalues` 和 `lastgaelam`。因此它既会**跳过 observation 位置，把前一轮 assistant 动作与后一轮 assistant 动作连接起来**，也会以同样方式跳过被 rejection 置零的 assistant token。
 
 例如：
 
@@ -397,7 +434,7 @@ GAE 遇到 `response_mask == 0` 的 observation token 时，不更新 `nextvalue
 response_mask: 1          0          1
 ```
 
-位置 1 的 value/TD error 不进入递推，位置 0 仍可接收到位置 2 的未来信号。这正是源码中“skip values and TD-error on observation tokens”的含义。
+位置 1 的 value/TD error 不进入递推，位置 0 仍可接收到位置 2 的未来信号。这正是源码中“skip values and TD-error on observation tokens”的行为；在当前 V1 时序下，rejected assistant token 也落入同一 `mask == 0` 分支，其自身 reward/value/TD error 不进入递推，但递推状态会跨过它继续向前传。
 
 参数直觉：
 
@@ -410,7 +447,7 @@ response_mask: 1          0          1
 
 ## 7. GRPO：用同一 prompt 的组内均值做相对 baseline
 
-GRPO 的 advantage 不使用 critic baseline，因此非 GAE estimator 在 `critic.enable` 未指定时默认关闭 critic；但若显式设置 `critic.enable=true`，trainer 仍会计算 value 并更新 critic，GRPO advantage 本身依然忽略这些 value，不能笼统理解为“GRPO 永远不训练 critic”。对同一个 prompt 采样 $n$ 个回答，形成一个 group；这里 $n$ 是同一 `uid` group 中的轨迹数，通常就是配置中的 `rollout.n`。当前实现用 `uid` 分组，入口在
+GRPO 的 advantage 不使用 critic baseline，因此非 GAE estimator 在 `critic.enable` 未指定时默认关闭 critic；但若显式设置 `critic.enable=true`，trainer 仍会计算 value 并更新 critic，GRPO advantage 本身依然忽略这些 value，不能笼统理解为“GRPO 永远不训练 critic”。对同一个 prompt 采样 $n$ 个回答，形成一个 group；在普通的“每个 session 一个 output”情况下，这里 $n$ 通常就是配置中的 `rollout.n`。当前实现用 `uid` 分组，入口在
 [`compute_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/ray_trainer.py#L235-L247)。
 
 ### 7.1 当前实现的精确公式
@@ -453,19 +490,22 @@ $$
 
 **符号说明**：$A_i$ 是第 $i$ 条轨迹的标量 advantage；$R_i$ 是其总分；$\mu_g$ 与 $\sigma_g$ 分别是所在 group 的均值和样本标准差；$\epsilon$（epsilon）是很小的正数，用来避免标准差为 0 时除以 0；分数线表示用分子 $R_i-\mu_g$ 除以分母 $\sigma_g+\epsilon$。`cases` 的大括号表示分情况定义；`norm_adv_by_std_in_grpo=True` 与 `False` 是选择两种情况的布尔配置，`[6pt]` 只增加两行之间的排版距离。
 
-这个标量再广播到该轨迹所有 `response_mask == 1` 的 token：
+这个标量再广播到该轨迹 correction 后所有 `response_mask == 1` 的 token：
 
 $$
 A_{i,t}=A_i\,m_{i,t}.
 $$
 
-**公式含义**：把轨迹级 advantage 复制到每个 token，再乘 mask；assistant token 保留该值，observation 和 padding 位置变成 0。
+**公式含义**：把轨迹级 advantage 复制到每个 token，再乘 correction 后的 mask；未被 rejection 去掉的 assistant token 保留该值，observation、padding 和 rejected assistant token 变成 0。
 
-**符号说明**：$A_{i,t}$ 是第 $i$ 条轨迹在时刻 $t$ 的 token-level advantage；$A_i$ 是整条轨迹共享的标量 advantage；$m_{i,t}$ 是对应位置的 `response_mask`，assistant token 为 1，其他位置为 0；相邻的 $A_i\,m_{i,t}$ 表示两者相乘。
+**符号说明**：$A_{i,t}$ 是第 $i$ 条轨迹在时刻 $t$ 的 token-level advantage；$A_i$ 是整条轨迹共享的标量 advantage；$m_{i,t}$ 是优势估计时对应位置的 post-correction `response_mask`，保留的 assistant token 为 1，observation、padding 或被 rejection 去掉的位置为 0；相邻的 $A_i\,m_{i,t}$ 表示两者相乘。
 
 实现见
 [`compute_grpo_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L266-L331)。vectorized 版本数学相同，见
 [`compute_grpo_vectorized_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L334-L358)。
+
+这里有一个 V1 配置接线差异：公共 dispatcher 只在精确的 `grpo` 分支传入 `norm_adv_by_std_in_grpo`，见
+[`ray_trainer.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/ray_trainer.py#L235-L279)。`grpo_vectorized` 落入通用分支，当前没有收到该参数，因此在固定快照中总是使用函数默认值 `True`。也就是说，两者在默认开启标准差归一化时数学相同，但把 `algorithm.norm_adv_by_std_in_grpo` 设为 `false` 只会改变精确的 `grpo`，不会改变 V1 的 `grpo_vectorized`。
 
 ### 7.2 数值例子
 
@@ -496,11 +536,13 @@ response_mask = [1, 1, 0, 0, 1]
 advantages ~= [0.999998, 0.999998, 0, 0, 0.999998]
 ```
 
-工具 observation 不产生 loss，但前后两段 assistant token 都得到同一个轨迹级 advantage。
+工具 observation 不产生 loss；若没有额外 rejection，前后两段 assistant token 都得到同一个轨迹级 advantage。若某个 assistant 位置已被 rejection 置零，则该位置的 advantage 也为 0。
 
 ### 7.3 GRPO 是 outcome-only
 
-当前函数首先执行 `token_level_rewards.sum(dim=-1)`，然后把一个标量广播到所有动作 token。因此它不会区分“哪个 token 收到了哪一个 process reward”。即使你提供多个 token reward，最终也只看它们的总和。
+当前函数首先执行 `token_level_rewards.sum(dim=-1)`，然后才把一个标量乘 correction 后的 `response_mask`。因此它不会区分“哪个 token 收到了哪一个 process reward”。即使你提供多个 token reward，最终也只看它们的总和。
+
+这个求和本身**没有先乘 post-correction `response_mask`**。因此 rejection 置零的 assistant 位置若已经有 reward（包括先前写入的 KL shaping 项），该 reward 仍会进入 $R_i$ 及 group 均值/标准差；rejection 只让该位置不接收广播后的 advantage。sequence-level rejection 把整行 mask 置零时，这一行的 reward 仍可能参与其他行的 group baseline，只是自身所有 token advantage 都归零。RLOO、`reinforce_plus_plus_baseline`、OPO、GPG 等先执行 `token_level_rewards.sum(dim=-1)` 的 outcome estimator 也有同一顺序。
 
 此外，GRPO 返回的 `returns` 直接等于 `advantages`。这里的 `returns` 只是为了统一 batch 接口，不是 GAE 意义上的折扣回报；通常也没有 critic 消费它。
 
@@ -514,6 +556,10 @@ advantages ~= [0.999998, 0.999998, 0, 0, 0.999998]
 
 如果一个自定义 Agent Loop 为同一 session 返回多个 `AgentLoopOutput`，V1 对 GRPO 只拿每个 session 的**最后一个 output**参与 group-relative 计算，再把得到的标量 advantage 广播回该 session 的其他 outputs。见
 [`compute_advantage_for_multi_trajectories`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/utils.py#L148-L217)。普通 `ToolAgentLoop` 通常每个 session 只有一个 output，因此不会感觉到这层处理。
+
+这个 session-final 折叠**只对精确的 `grpo` estimator 生效**。wrapper 对其他 estimator 直接把整批 output rows 交给通用 `compute_advantage`，见上述函数的
+[`L167-L176`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/utils.py#L167-L176)。V1 会把每个 output 都以 `{uid}_{session_id}_{index}` 存成一行；当 streaming reward 已在 Agent Loop 内产生 `final_output.reward_score` 时，还会把该最终 reward 复制给同 session 前面的 outputs，见
+[`agent_loop_tq.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L172-L203)。因此对 RLOO、`reinforce_plus_plus_baseline`、`rloo_vectorized` 等 group estimator，自定义 multi-output loop 会让同一 session 的多行都参与 `uid` 分组；group size 可能大于 `rollout.n`，而 streaming 分支中同一 session reward 会重复出现。不能把 GRPO 本节的 session-final 语义外推到这些 estimator。
 
 ---
 
@@ -563,7 +609,7 @@ A_2 = 0.5 - mean(1.0, 0.0) =  0.00
 
 - RLOO 不除以 group 标准差。
 - RLOO baseline 不包含当前样本自身。
-- RLOO 仍是 outcome-only，并把标量广播到所有有效动作 token。
+- RLOO 仍是 outcome-only，并把标量广播到 correction 后保留的动作 token；rejection 与 reward 求和的先后顺序见 7.3 节。普通单 output session 中，group 通常有 `rollout.n` 行；自定义 multi-output session 则受 7.5 节的非 GRPO 限制影响，每个 output row 都会参与 baseline。
 - 若 group 只有一个样本，普通 `rloo` 实现没有可用 baseline，会在广播前保留原始 score；`rloo_vectorized` 则把 singleton group 的 advantage 明确归零。两者在这个边界上并不等价，实际训练应保证 `rollout.n >= 2`，不要依赖任一静默 fallback。
 
 ---
@@ -576,7 +622,7 @@ $$
 G_t=r_t+\gamma r_{t+1}+\gamma^2r_{t+2}+\cdots,
 $$
 
-**公式含义**：时刻 $t$ 的 reward-to-go，是从当前位置起把现在和未来的 reward 全部累加；只有当 $|\gamma|<1$ 时，越远的 reward 权重才会几何缩小，`gamma=1` 时所有未来 reward 等权。有限轨迹在 episode 结束处停止求和。这个公式描述没有内部 mask 断点时的完整传播；当前实现遇到 tool observation 的 mask 0 会截断，具体见 9.1 节。
+**公式含义**：时刻 $t$ 的 reward-to-go，是从当前位置起把现在和未来的 reward 全部累加；只有当 $|\gamma|<1$ 时，越远的 reward 权重才会几何缩小，`gamma=1` 时所有未来 reward 等权。有限轨迹在 episode 结束处停止求和。这个公式描述没有内部 mask 断点时的完整传播；当前实现遇到 post-correction mask 0 会截断，具体见 9.1 节。
 
 **符号说明**：$G_t$ 是从时刻 $t$ 开始的累计未来回报；$r_t$、$r_{t+1}$、$r_{t+2}$ 是当前、下一步和下两步的 reward；$\gamma$ 是折扣因子，$\gamma^2$ 表示折扣因子连乘两次，因此当 $0\le\gamma<1$ 时两步后的 reward 权重更小；$\cdots$ 表示继续按同样规律加到轨迹结束。各项之间的加号表示把不同时间的 reward 汇总。
 
@@ -588,7 +634,7 @@ $$
 
 **公式含义**：将所有有效 token 的 reward-to-go 做全 batch 白化：每个值先减去全体均值，再除以“样本方差加固定稳定项后开平方”的结果，使输出近似以 0 为中心，并把不同 batch 的尺度拉到相近范围。这是源码 `masked_whiten` 的形式；稳定项加在方差里面、开平方之前，并不是在标准差之后再加一个 epsilon。
 
-**符号说明**：$A_t$ 是时刻 $t$ 白化后的 advantage；$G_t$ 是该时刻的 reward-to-go；$\mu_G$ 是当前 batch 所有 `response_mask == 1` 位置的 $G$ 均值；$v_G$ 是这些有效值带 Bessel 校正的样本方差，直观上就是把每个值与均值之差的平方相加，再除以“有效 token 数减 1”；根号把方差换回与 $G$ 相同的尺度。$10^{-8}$ 是写死的数值稳定常数，分数线表示 $G_t-\mu_G$ 除以整个根号结果；下标 $G$ 表示这些统计量来自 reward-to-go 集合。这里的样本数是全 batch 的有效 token 总数，不是 `uid` group 数；若该总数为 1，`masked_var` 会直接抛出 `ValueError`，稳定常数不会绕过这个检查。
+**符号说明**：$A_t$ 是时刻 $t$ 白化后的 advantage；$G_t$ 是该时刻的 reward-to-go；$\mu_G$ 是当前 batch 所有 post-correction `response_mask == 1` 位置的 $G$ 均值；$v_G$ 是这些有效值带 Bessel 校正的样本方差，直观上就是把每个值与均值之差的平方相加，再除以“有效 token 数减 1”；根号把方差换回与 $G$ 相同的尺度。$10^{-8}$ 是写死的数值稳定常数，分数线表示 $G_t-\mu_G$ 除以整个根号结果；下标 $G$ 表示这些统计量来自 reward-to-go 集合。这里的样本数是全 batch 被 correction 保留的 token 总数，不是 `uid` group 数；若该总数为 1，`masked_var` 会直接抛出 `ValueError`，稳定常数不会绕过这个检查。
 
 实现见
 [`compute_reinforce_plus_plus_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L693-L729)。
@@ -602,7 +648,7 @@ returns = [1, 1, 1]
 
 每个 token 都获得最终结果，再由 batch-level whitening 产生正负相对信号。
 
-### 9.1 Tool Agent Loop 的重要陷阱
+### 9.1 post-correction mask 0 会截断 credit
 
 当前 REINFORCE++ 递推在每个位置执行：
 
@@ -612,7 +658,7 @@ returns[:, t] = running_return
 running_return = running_return * response_mask[:, t]
 ```
 
-源码注释写的是“Reset after EOS”，但 Tool Agent Loop 的工具 observation 同样满足 `response_mask == 0`。因此对：
+源码注释写的是“Reset after EOS”，但递推实际读取的是 correction 后的 `response_mask`。因此 Tool Agent Loop 的工具 observation 和 rollout rejection 置零的 assistant token 都会触发 reset。先看只有 tool observation 的例子：
 
 ```text
 内容:          assistant  tool-observation  final-assistant
@@ -626,14 +672,16 @@ reward:            0             0                 1
 returns = [0, 1, 1]
 ```
 
-中间 observation 的 return 会被 loss mask 忽略，而工具调用之前的 assistant token 接收不到最终 reward。也就是说，这个 estimator 当前不会像 GAE 那样跨过 observation 的 0 mask 传播 return。对多轮 tool-agent 训练选择它之前，应先确认这种 credit-assignment 语义正是你想要的。
+中间 observation 的 return 会被 `response_mask` 忽略，而工具调用之前的 assistant token 接收不到最终 reward。也就是说，这个 estimator 当前不会像 GAE 那样跨过 mask 0 传播 return。若 mask 0 来自 rejection，rejected token 自身不参与白化/loss，而且它还会阻断更早 token 接收其右侧 reward。对多轮 tool-agent 或启用 rollout rejection 的训练选择它之前，应先确认这种 credit-assignment 语义正是你想要的。
 
 ### 9.2 `reinforce_plus_plus_baseline`
 
 baseline 变体先减去同一 `uid` group 的**包含自身**的均值，再把标量广播到 token，最后在全 batch 上 whiten。实现见
 [`compute_reinforce_plus_plus_baseline_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L533-L584)。
 
-这里有一个 singleton 特判：若某个 `uid` group 只有一条回答，当前实现把该组 baseline 设为 0，所以白化前保留原始轨迹 score，而不是用“自身均值”把它减成 0。随后该标量仍会广播到有效 token，并与全 batch 一起白化；因此这个特判既不保证最终 advantage 非零，也不能避免“全 batch 只有一个有效 token”时的样本方差错误。
+这里有一个 singleton 特判：若某个 `uid` group 只有一条回答，当前实现把该组 baseline 设为 0，所以白化前保留原始轨迹 score，而不是用“自身均值”把它减成 0。随后该标量仍会广播到 post-correction mask 保留的 token，并与全 batch 一起白化；因此这个特判既不保证最终 advantage 非零，也不能避免“全 batch 只有一个有效 token”时的样本方差错误。它的轨迹 score 仍在乘 mask 之前求和，所以同样受 7.3 节说明的 rejection 时序影响。
+
+与 RLOO 一样，当前 V1 不会为这个 baseline 变体折叠 custom Agent Loop 的 multi-output session；每个 output row 都会进入 `uid` group，具体语义见 7.5 节。
 
 它与 RLOO 的区别是：
 
@@ -653,7 +701,7 @@ algorithm:
   adv_estimator: reinforce_plus_plus
 ```
 
-只会选择本节的 reward-to-go/whitening，不会自动把单个有效 token 的 loss 改成 $-\log\pi_\theta(a_t\mid s_t)\,A_t$。这个式子表示“负的 token log-policy 乘 advantage”：负号让最小化 loss 等价于提高正 advantage 动作的概率；$\log$ 是自然对数；$\pi_\theta(a_t\mid s_t)$ 是参数为 $\theta$ 的策略在状态 $s_t$ 下选择动作 $a_t$ 的概率；$A_t$ 是该动作的 advantage，相邻两项表示相乘。实际 batch loss 还要只对 mask 为 1 的 token 聚合。这一点在下一章展开。
+只会选择本节的 reward-to-go/whitening，不会自动把单个有效 token 的 loss 改成 $-\log\pi_\theta(a_t\mid s_t)\,A_t$。这个式子表示“负的 token log-policy 乘 advantage”：负号让最小化 loss 等价于提高正 advantage 动作的概率；$\log$ 是自然对数；$\pi_\theta(a_t\mid s_t)$ 是参数为 $\theta$ 的策略在状态 $s_t$ 下选择动作 $a_t$ 的概率；$A_t$ 是该动作的 advantage，相邻两项表示相乘。实际 batch loss 还要只对 post-correction mask 为 1 的 token 聚合。这一点在下一章展开。
 
 ---
 
@@ -664,13 +712,13 @@ algorithm:
 
 | estimator | baseline/变换 | 适用信号 | 入口 |
 |---|---|---|---|
-| `grpo_vectorized` | 与 GRPO 相同，纯 PyTorch 分组向量化 | outcome | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L334-L358) |
+| `grpo_vectorized` | 默认 `norm_adv_by_std_in_grpo=True` 时与 GRPO 数学相同；当前 V1 dispatcher 不转发该 flag，因此配置 `false` 对它无效 | outcome | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L334-L358) |
 | `rloo_vectorized` | group size 大于 1 时与 RLOO 相同；singleton advantage 归零 | outcome | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L831-L866) |
 | `remax` | sampled return 减 greedy rollout reward | outcome | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L732-L765) |
-| `grpo_passk` | 每组仅最佳样本得到 `max - second_max` | Pass@k | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L471-L530) |
-| `opo` | 按 response length 加权的 group reward baseline | outcome/长度校正 | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L639-L690) |
-| `gpg` | group-centering 后按非零 reward 比例缩放 | outcome | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L768-L828) |
-| `gdpo` | 每个 reward 维度分别做 GRPO，再加权和并 whiten | 多维 outcome reward | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L361-L468) |
+| `grpo_passk` | group 至少需 2 条；仅最佳样本得到 `max - second_max`，默认还除以 group 样本标准差 `std + epsilon` | Pass@k | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L471-L530) |
+| `opo` | 按 post-correction `response_mask.sum(-1)`，即未被 rejection 去掉的 assistant 动作 token 数加权 group reward baseline；不计 tool observation | outcome/长度校正 | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L639-L690) |
+| `gpg` | group-centering 后乘 `B / max(count_nonzero(scores), 1)`，再除以 `f_norm`；即按非零轨迹比例的倒数缩放 | outcome | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L768-L828) |
+| `gdpo` | 算法函数会对每个 reward 维度分别做 GRPO，再加权和并 whiten；当前默认 V1 数据路径未传递所需字段，见 3.2 节 | 多维 outcome reward | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L361-L468) |
 | `optimal_token_baseline` | 用 token/path 方差 proxy 学构造更细 baseline | 单轮高级用法 | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L869-L987) |
 | `tir_optimal_token_baseline` | 面向多轮轨迹的 optimal-token 版本 | 多轮高级用法 | [`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L988-L1118) |
 
@@ -688,6 +736,10 @@ algorithm:
 | token credit | 逐 token 递推 | 轨迹标量广播 | 轨迹标量广播 | reward-to-go |
 | 当前可跨 tool observation 传播最终 reward | 是，跳过 mask 0 | 是，整轨迹求和后广播 | 是，整轨迹求和后广播 | 否，mask 0 会 reset |
 | `returns` 的含义 | critic target | 等于 advantage 的接口字段 | 等于 advantage 的接口字段 | 未 whiten 的 reward-to-go |
+
+表中的 mask 都是优势估计时的 post-correction `response_mask`：tool observation、padding 和 rejected assistant token 都为 0。GAE 会跨过这三类 0；GRPO/RLOO 先对未清零的 reward 求轨迹和，再只向 mask 为 1 的位置广播；REINFORCE++ 则在每个 0 处 reset。
+
+表中“同 prompt 多采样”默认每个 rollout session 只产生一个 output。对自定义 multi-output Agent Loop，只有精确的 `grpo` estimator 应用 session-final 折叠；RLOO 和其他 group estimator 的实际分组行数可能大于 `rollout.n`，见 7.5 节。
 
 一个实用选择顺序：
 
@@ -715,7 +767,7 @@ algorithm:
   norm_adv_by_std_in_grpo: true
 ```
 
-一个 trainer step 会围绕两个 prompt 形成两个 group：
+假设这里的 Agent Loop 每个 session 只返回一个 output，一个 trainer step 会围绕两个 prompt 形成两个 group：
 
 ```text
 uid=A -> trajectory A0, A1, A2 -> rewards [1.0, 0.0, 0.5]
@@ -729,7 +781,7 @@ A group -> [ 0.999998, -0.999998, 0.0]  # default epsilon=1e-6
 B group -> [ 0.0,  0.0, 0.0]
 ```
 
-然后每个标量被广播到各自所有 assistant token，tool observation 和 padding 位置乘 `response_mask` 归零。下一章的 PPO loss 再用这些 token-level advantage 更新 actor。
+然后每个标量被广播到各自 post-correction `response_mask == 1` 的 assistant token；tool observation、padding 和 rejected assistant 位置归零。下一章的 PPO loss 再用这些 token-level advantage 更新 actor。
 
 ---
 
@@ -739,11 +791,11 @@ B group -> [ 0.0,  0.0, 0.0]
 
 1. `rm_scores.sum(-1)` 是否等于你期望的轨迹总分。
 2. `token_level_rewards.sum(-1)` 是否因 KL 系数过大而改变符号或量级。
-3. `response_mask` 是否正确区分 assistant 与 tool observation。
-4. group estimator 的 `uid` 是否真的让同一 prompt 的 $n$ 条 rollout 聚在一起；这里 $n$ 是每个相同 `uid` group 应有的采样回答数，通常应等于 `rollout.n`，不是全 batch 的轨迹总数。
+3. 分阶段检查 mask：Agent Loop 写入时 `response_mask` 是否正确区分 assistant 与 tool observation；rollout correction 后是否只额外置零了预期的 rejected assistant token；`loss_mask` 是否仍保留原始 assistant-token 计数。
+4. 先区分 Agent Loop 是单 output 还是 multi-output：单 output 时，同一 `uid` group 通常应有 `rollout.n` 行；multi-output 时，对 `grpo` 应按 `{uid}_{session_id}` 检查 `rollout.n` 个 session-final outputs，对 RLOO 等其他 group estimator 则必须检查实际 `{uid}_{session_id}_{index}` output rows，行数可能大于 `rollout.n`。
 5. GRPO/RLOO 的 group 是否全部同分；同分就没有相对信号。
 6. `advantages[response_mask.bool()]` 的均值、标准差、正负比例是否合理。
-7. 多轮工具训练若使用 REINFORCE++，检查 mask 0 是否意外截断最终 reward。
+7. 多轮工具训练或启用 rollout rejection 时若使用 REINFORCE++，检查 observation/rejected-token 的 mask 0 是否意外截断最终 reward。
 8. 最后再看 PPO ratio、clip fraction 和 loss；advantage 生成之前的问题，不能靠调 clip ratio 修复。
 
 下一章会把 `advantages` 接到 actor/critic 的实际 loss、mini-batch 和 micro-batch 更新路径上。
