@@ -114,7 +114,7 @@ Hydra 配置的组合入口是 [`ppo_trainer.yaml`](https://github.com/verl-proj
 
 对应的 CPU 测试入口是 [`tests/utils/dataset/test_rl_dataset_on_cpu.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/tests/utils/dataset/test_rl_dataset_on_cpu.py)。
 
-### 问题 3：同一个 prompt 的 `n` 条 rollout 在哪里产生？
+### 问题 3：同一个 prompt 的 $n$ 条 rollout 在哪里产生？
 
 V1 中不是 controller 先 `repeat(n)`，而是 AgentLoop worker 为一个 prompt 启动多个 session：
 
@@ -123,7 +123,7 @@ V1 中不是 controller 先 `repeat(n)`，而是 AgentLoop worker 为一个 prom
 3. [`AgentLoopWorkerTQ._run_prompt`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L149)：读取 `rollout.n`，创建 `session_id in [0,n)` 的任务。
 4. [`_agent_loop_postprocess`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L150-L227)：写入 `{uid}_{session_id}_{index}` trajectory key。
 
-如果实际 trajectory 数量不是 `P*n`，重点检查：
+如果实际 trajectory 数量不是 $P\times n$，重点检查：
 
 - 某些 session 是否失败。
 - 自定义 AgentLoop 是否返回 `None` 或多段 output。
@@ -375,9 +375,9 @@ trainer 的加载、恢复 in-flight prompts 与保存编排在 [`trainer_base.p
 | Reference policy | 冻结基线，用于 KL 约束 | 不做 optimizer step | [`_compute_ref_log_prob`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1540-L1564) |
 | Critic / value model | 估计从当前状态出发的 expected return | reward model 判断结果好坏；critic 估计未来回报 | [`CriticConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/critic.py#L47-L140) |
 | Reward | 环境/验证器对行为结果给出的反馈 | 不等于 advantage，也不等于 return | [`reward.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/reward.py#L111-L167) |
-| Return | 从某位置开始的累计折扣 reward target | GAE 中常为 `advantage + value` | [`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263) |
+| Return | 从某位置开始的累计折扣 reward target | GAE 中常为 $A_t+V_t$，即同一位置的 advantage 与 value 之和 | [`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263) |
 | Advantage | 相比 baseline，这个 action 有多好 | 正值并不等于 raw reward 为正 | [`compute_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/ray_trainer.py#L187-L282) |
-| GAE | 用 `gamma`、`lambda` 平衡 bias/variance 的 advantage estimator | 需要 critic values | [`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263) |
+| GAE | 用 $\gamma$、$\lambda$ 平衡 bias/variance 的 advantage estimator | 需要 critic values | [`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263) |
 | GRPO | 同 prompt 多条 rollout 内做相对归一化的 outcome estimator | 分组 key 是关键；通常不需要 critic | [`compute_grpo_outcome_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L266-L331) |
 | PPO clip | 限制新旧 policy probability ratio 变化幅度 | clip 不是直接裁剪梯度 | [`compute_policy_loss_vanilla`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L1283-L1375) |
 | KL penalty | 惩罚 policy 偏离 reference 或其他 anchor | 可加在 reward，也可作为 loss 项 | [`apply_kl_penalty`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/ray_trainer.py#L78-L117) |
@@ -390,7 +390,7 @@ trainer 的加载、恢复 in-flight prompts 与保存编排在 [`trainer_base.p
 | 术语 | 小白定义 | 不要混淆 | 源码落点 |
 | --- | --- | --- | --- |
 | Prompt | AgentLoop 开始前的输入消息/上下文 | DataLoader prompt 还可能不是 token ids | [`RLHFDataset.__getitem__`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/dataset/rl_dataset.py#L386-L411) |
-| Trajectory | 一次完整生成/环境交互得到的经验 | 同一 prompt 可有 `n` 条 | [`AgentLoopOutput`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L90-L157) |
+| Trajectory | 一次完整生成/环境交互得到的经验 | 同一 prompt 可有 $n$ 条 | [`AgentLoopOutput`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L90-L157) |
 | Turn | 对话中的一次 user/assistant/tool 消息交替 | 一条 trajectory 可含多 turn | [`ToolAgentLoop`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L124-L206) |
 | Token | tokenizer 后的离散 id | tool observation 也会成为 token，但不是 actor action | [`AgentLoopOutput.as_dict`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L116-L157) |
 | Padding | 把不同长度序列补到同宽 | V1 TransferQueue 主路径尽量保留 jagged 数据 | [`padding.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/padding.py#L23-L143) |
@@ -400,7 +400,7 @@ trainer 的加载、恢复 in-flight prompts 与保存编排在 [`trainer_base.p
 | `uid` | prompt group 的唯一 id | 不等于 dataset `index` | [`_fetch_one_gen_batch`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1315-L1326) |
 | `session_id` | 一个 uid 的第几次 rollout | `index` 是同一 session 的第几段 output | [`_run_prompt`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L149) |
 | TensorDict | 能统一 slice/chunk 一组 tensor 与 non-tensor 字段的容器 | 不要求所有值都是普通 dense tensor | [`tensordict_utils.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tensordict_utils.py#L377-L455) |
-| NestedTensor / jagged | 每一行序列长度可不同的 tensor 表示 | 逻辑 `[B,j]` 中的 `j` 不是固定整数 | [`list_of_dict_to_tensordict`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tensordict_utils.py#L918-L949) |
+| NestedTensor / jagged | 每一行序列长度可不同的 tensor 表示 | 逻辑 $[B,j]$ 中的 $j$ 不是固定整数 | [`list_of_dict_to_tensordict`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tensordict_utils.py#L918-L949) |
 | `NonTensorStack` | 每个 batch row 一个 Python 对象 | 与整批共享的 `NonTensorData` 不同 | [`assign_non_tensor_stack`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tensordict_utils.py#L48-L74) |
 | DataProto | `TensorDict + np object arrays + meta_info` 的兼容协议 | V1 不再全程只用它 | [`DataProto`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/protocol.py#L317-L341) |
 | TransferQueue | trajectory 真字段的共享 KV data plane | 不是 Python `queue.Queue` | [`agent_loop_tq.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L150-L227) |
@@ -598,9 +598,9 @@ HF Dataset row
 
 完成标准：能指出哪个阶段需要 batch dim，哪个阶段又回到普通 Python dict。
 
-### 练习 3：手算 `P=2,n=3` 的 key 与 shape
+### 练习 3：手算 $P=2,\ n=3$ 的 key 与 shape
 
-自己写出六个 `{uid}_{session_id}_{index}` key，并假设六条 response lengths 为 `[3,5,4,2,4,6]`：
+自己写出六个 `{uid}_{session_id}_{index}` key，并假设六条 response lengths 为 $[3,5,4,2,4,6]$：
 
 1. 写出 NestedTensor offsets。
 2. 写出 advantage padding 后的 shape。
@@ -758,7 +758,7 @@ weight-sync global step
 1. 当前默认入口怎样选择 V1 与 V0？
 2. 为什么 `RLHFDataset` 过滤 prompt 时会 tokenize，但 `__getitem__` 仍返回 `raw_prompt`？
 3. dataset `collate_fn` 与 `verl.protocol.collate_fn` 有什么区别？
-4. `P=2,n=3` 时，哪一层 batch size 是 2，哪一层通常是 6？
+4. $P=2,\ n=3$ 时，哪一层 batch size 是 2，哪一层通常是 6？
 5. V1 为什么同时需要 TransferQueue 与 KVBatchMeta？
 6. `uid`、`session_id`、trajectory `index` 分别表示什么？
 7. tool observation 为什么 `attention_mask=1` 而 `loss_mask=0`？

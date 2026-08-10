@@ -128,7 +128,7 @@ $$
 
 **符号说明：**
 
-- $t$ 是 response 中的 token 位置；下标 `old,t` 或 `θ,t` 同时说明“来自哪个策略、对应哪个位置”。
+- $t$ 是 response 中的 token 位置；下标 $\mathrm{old},t$ 或 $\theta,t$ 同时说明“来自哪个策略、对应哪个位置”。
 - $a_t$ 是第 $t$ 步已经采样出来的动作；在语言模型中，动作就是选中的 token。
 - $s_t$ 是选择 $a_t$ 前模型已经看到的状态，即 prompt 加上此前 token；竖线 $\mid$ 读作“在……条件下”。
 - $\pi_{old}(a_t\mid s_t)$ 和 $\pi_\theta(a_t\mid s_t)$ 是两个 policy 分别给该 token 的条件概率，取值在 0 到 1 之间。
@@ -161,7 +161,7 @@ ratio = torch.exp(negative_approx_kl)
 ```
 
 见
-[`compute_policy_loss_vanilla`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L1283-L1374)。上面的概率比是数学定义；实现先把原始 log-ratio 裁剪到 `[-20, 20]`，再计算 `ratio`。因此只有原始 log-ratio 落在该区间内时，代码值才与未裁剪公式完全相同。这个 clamp 不仅防止 `exp` 溢出，也把有效 ratio 限制在 `exp(-20)` 到 `exp(20)`；落在饱和区外时，梯度不会继续穿过 clamp 回传到原始 log-ratio。
+[`compute_policy_loss_vanilla`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L1283-L1374)。上面的概率比是数学定义；实现先把原始 log-ratio 裁剪到 $[-20,20]$，再计算 `ratio`。因此只有原始 log-ratio 落在该区间内时，代码值才与未裁剪公式完全相同。这个 clamp 不仅防止 `exp` 溢出，也把有效 ratio 限制在 $\exp(-20)$ 到 $\exp(20)$；落在饱和区外时，梯度不会继续穿过 clamp 回传到原始 log-ratio。
 
 还要区分“PPO ratio”和“采样分布校正”：trajectory 中的动作实际来自 $\pi_{\mathrm{rollout}}$，而 $\rho_t=\pi_\theta/\pi_{\mathrm{old}}$ 只负责约束当前 actor 相对 proximal anchor 的更新，并不会自动校正 $\pi_{\mathrm{rollout}}$ 与 $\pi_{\mathrm{old}}$ 的差异。只有显式启用 `rollout_is` 时，verl 才会在 clipped policy-gradient 项之后再乘近似的 $\pi_{\mathrm{old}}/\pi_{\mathrm{rollout}}$ 权重；这个额外权重不乘到 `ppo_kl`、entropy 或 reference-KL 项上。这里三条分数线都表示“前一个 policy 给已采样 token 的概率除以后一个 policy 的概率”，三个 policy 的角色沿用第 2 节。
 
@@ -315,7 +315,7 @@ $$
 公共 actor loss 入口是
 [`workers/utils/losses.py::ppo_loss`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L57-L144)。它做四件事：
 
-1. 把 no-padding/nested model output 重新对齐成 `[B, response_length]`。
+1. 把 no-padding/nested model output 重新对齐成 $[B,L_{\text{response}}]$。
 2. 读取 `old_log_probs`、`advantages`、`response_mask`。
 3. 根据 `policy_loss.loss_mode` dispatch 到具体 policy loss。
 4. 可选加入 entropy bonus 和 reference KL loss。
@@ -674,7 +674,7 @@ aggregation 的分母还可能使用 engine 预先统计的 `batch_num_tokens = 
 
 因此：
 
-- prompt token 不在 `[B,response_length]` loss matrix 中。
+- prompt token 不在 $[B,L_{\text{response}}]$ loss matrix 中。
 - tool observation 的 `response_mask=0`，不产生 policy/value/KL/entropy loss。
 - response padding 的 mask 也是 0。
 - V1 为批次整除而添加的 synthetic padding sample，其整个 `response_mask` 都是 0，因此不会产生梯度，见
@@ -832,7 +832,7 @@ extra_info["mini_batch_size"] = ppo_mini_batch_size
 [`trainer_base.py::_update_actor`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1672-L1705)。critic 路径也做同样乘法，见
 [`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1649-L1669)。
 
-因此在当前标准路径中，配置 `M=32, n=8` 对应 worker 中每个 actor mini-batch 为 256 条 trajectory。可以把配置值理解成 **prompt-group 等价大小**；源码中的实际 trajectory mini-batch 是 $M\times n$，其中 $M$ 是配置的 prompt-group 等价 mini-batch 大小，$n$ 是每个 prompt 的 rollout 数，$\times$ 表示相乘，结果是 worker 实际收到的轨迹条数。
+因此在当前标准路径中，$M=32,\ n=8$ 对应 worker 中每个 actor mini-batch 为 256 条 trajectory。可以把配置值理解成 **prompt-group 等价大小**；源码中的实际 trajectory mini-batch 是 $M\times n$，其中 $M$ 是配置的 prompt-group 等价 mini-batch 大小，$n$ 是每个 prompt 的 rollout 数，$\times$ 表示相乘，结果是 worker 实际收到的轨迹条数。
 
 ### 11.3 micro-batch
 

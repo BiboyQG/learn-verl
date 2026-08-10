@@ -6,16 +6,16 @@
 
 我们会固定一个贯穿全章的最小例子：
 
-- 每个训练 step 读取 `P = 2` 个 prompt；
-- 每个 prompt 采样 `n = 3` 条 trajectory；
-- 因此在“六个 session 全部成功、每个 session 只产生一个最终输出”的简单情形下，共有 `N = P × n = 6` 条 trajectory；
+- 每个训练 step 读取 $P=2$ 个 prompt；
+- 每个 prompt 采样 $n=3$ 条 trajectory；
+- 因此在“六个 session 全部成功、每个 session 只产生一个最终输出”的简单情形下，共有 $N=P\times n=6$ 条 trajectory；
 - 使用当前默认的 **V1 sync trainer**；
 - 使用 GRPO advantage；
 - 使用 rule-based reward；
 - actor loss 中启用 reference-policy KL；
 - 不使用 critic。
 
-这里的 `P=2, n=3` 是为了看清数据形状，不是推荐的生产配置。真实多 GPU 训练还必须满足 data-parallel world size、PPO mini-batch 和 token budget 的整除约束。
+这里的 $P=2,\ n=3$ 是为了看清数据形状，不是推荐的生产配置。真实多 GPU 训练还必须满足 data-parallel world size、PPO mini-batch 和 token budget 的整除约束。
 
 ---
 
@@ -362,7 +362,7 @@ while not finished:
 
 源码见 [`PPOTrainer.step()` / `_step_once()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L509-L586)。
 
-sync 模式的 `parameter_sync_step` 为 1，所以一个 global step 只执行一次 `_step_once()`。本章的 `P=2` 表示每次取两个 prompt，与 `parameter_sync_step` 不是同一个概念；后者主要在 `separate_async` 中把一个 global step 拆成多个 local update。
+sync 模式的 `parameter_sync_step` 为 1，所以一个 global step 只执行一次 `_step_once()`。本章的 $P=2$ 表示每次取两个 prompt，与 `parameter_sync_step` 不是同一个概念；后者主要在 `separate_async` 中把一个 global step 拆成多个 local update。
 
 ## 8. 总调用时序图
 
@@ -416,7 +416,7 @@ sequenceDiagram
 
 如果启用的是 colocated reward model，图中的 reward-loop worker 不会与 rollout 并行；trainer 在 `ReplayBuffer.sample()` 之后暂停 rollout，再执行 `_compute_reward_colocate()`。
 
-## 9. `P=2, n=3`：字段与 shape 的完整演进
+## 9. $P=2,\ n=3$：字段与 shape 的完整演进
 
 先定义符号：
 
@@ -440,7 +440,7 @@ row 0: uid=uA, raw_prompt=[{role: user, content: ...}], ...
 row 1: uid=uB, raw_prompt=[{role: user, content: ...}], ...
 ```
 
-此时 batch size 是 `P=2`，还不是 6。`_fetch_one_gen_batch()` 添加 UUID，`_next_train_batch()` 添加 `global_steps`，见 [`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1315-L1343)。
+此时 batch size 是 $P=2$，还不是 6。`_fetch_one_gen_batch()` 添加 UUID，`_next_train_batch()` 添加 `global_steps`，见 [`trainer_base.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1315-L1343)。
 
 ### 9.2 阶段 B：注册两个 prompt marker
 
@@ -477,15 +477,15 @@ uB_0_0  uB_1_0  uB_2_0
 
 | 字段 | 单条 shape | 六条合并后的逻辑 shape | 含义 |
 |---|---:|---:|---|
-| `prompts` | `[p_i]` | `[6, jagged_prompt]` | prompt token ids |
-| `responses` | `[r_i]` | `[6, jagged_response]` | 模型 token 与 tool observation token |
-| `response_mask` | `[r_i]` | `[6, jagged_response]` | 模型生成 token 为 1，tool observation 为 0 |
-| `loss_mask` | `[r_i]` | `[6, jagged_response]` | 当前实现复制自 `response_mask` |
-| `input_ids` | `[p_i+r_i]` | `[6, jagged_total]` | `prompts + responses` |
-| `position_ids` | 与 input 对齐 | `[6, jagged_total]` 或多模态形式 | 位置编码输入 |
-| `rollout_log_probs` | `[r_i]` | `[6, jagged_response]` | inference backend 生成时的 logprob |
-| `rm_scores` | `[r_i]` | `[6, jagged_response]` | token-level reward；常把 scalar 放在末 token |
-| `uid` | scalar | `[6]` | 三个 `uA` 与三个 `uB`；不要求相邻 |
+| `prompts` | $[p_i]$ | $[6,\mathrm{jagged\_prompt}]$ | prompt token ids |
+| `responses` | $[r_i]$ | $[6,\mathrm{jagged\_response}]$ | 模型 token 与 tool observation token |
+| `response_mask` | $[r_i]$ | $[6,\mathrm{jagged\_response}]$ | 模型生成 token 为 1，tool observation 为 0 |
+| `loss_mask` | $[r_i]$ | $[6,\mathrm{jagged\_response}]$ | 当前实现复制自 `response_mask` |
+| `input_ids` | $[p_i+r_i]$ | $[6,\mathrm{jagged\_total}]$ | `prompts + responses` |
+| `position_ids` | 与 input 对齐 | $[6,\mathrm{jagged\_total}]$ 或多模态形式 | 位置编码输入 |
+| `rollout_log_probs` | $[r_i]$ | $[6,\mathrm{jagged\_response}]$ | inference backend 生成时的 logprob |
+| `rm_scores` | $[r_i]$ | $[6,\mathrm{jagged\_response}]$ | token-level reward；常把 scalar 放在末 token |
+| `uid` | scalar | $[6]$ | 三个 `uA` 与三个 `uB`；不要求相邻 |
 
 `AgentLoopOutput` 的字段定义及 reward 写法见 [`agent_loop.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L90-L157)，TQ postprocess 见 [`agent_loop_tq.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L150-L227)。
 
@@ -581,7 +581,7 @@ ratio_t = exp(current_log_prob_t - old_log_prob_t)
 
 如果设置 `algorithm.rollout_correction.bypass_mode=true`，才会直接令 `old_log_probs = rollout_log_probs`。
 
-### 9.9 阶段 I：把 jagged 字段 pad 成 `[6, R]`
+### 9.9 阶段 I：把 jagged 字段 pad 成 $[6,R]$
 
 advantage 是少数在 controller 上显式读取实际 tensor 的阶段。`_compute_advantage()` 从 TQ 取出：
 
@@ -595,7 +595,7 @@ ref_log_prob
 values（若存在）
 ```
 
-然后调用 `to_padded_tensor()`。对本例，核心 response 字段从 `[6, jagged_response]` 暂时变成：
+然后调用 `to_padded_tensor()`。对本例，核心 response 字段从 $[6,\mathrm{jagged\_response}]$ 暂时变成：
 
 ```text
 response_mask:      [6, R]
@@ -641,7 +641,7 @@ uB: [-1.155,  0.577,  0.577]
 advantages[i, t] = A_i * response_mask[i, t]
 ```
 
-于是 dense `advantages` 和 `returns` 都是 `[6, R]`；tool observation 与 padding 位置为 0。写回 TQ 时，它们又被还原为：
+于是 dense `advantages` 和 `returns` 都是 $[6,R]$；tool observation 与 padding 位置为 0。写回 TQ 时，它们又被还原为：
 
 ```text
 advantages: [6, jagged_response]
@@ -660,7 +660,7 @@ uA_0_1
 uA_0_2
 ```
 
-这时总 trajectory 行数可能大于 `P × n = 6`。V1 的 GRPO 包装只让每个 `{uid}_{session_id}` 的**最大 output index**参与 group-relative advantage，然后把这个 session 的最终 advantage 广播到该 session 的较早输出。这样同一个 rollout session 不会因为产生多个中间片段而在 GRPO group 中重复占票。
+这时总 trajectory 行数可能大于 $P\times n=6$。V1 的 GRPO 包装只让每个 `{uid}_{session_id}` 的**最大 output index**参与 group-relative advantage，然后把这个 session 的最终 advantage 广播到该 session 的较早输出。这样同一个 rollout session 不会因为产生多个中间片段而在 GRPO group 中重复占票。
 
 更精确地说，balance 之前的有效行数是：
 
@@ -668,7 +668,7 @@ uA_0_2
 N = sum(outputs produced by every prompt/session)
 ```
 
-所以多输出 session 可令 `N > P × n`，失败或没有产出 output 的 session 也可令 `N < P × n`；之后 `_balance_batch()` 还可能补 synthetic padding rows。`P × n = 6` 只是本章的 happy path。
+所以多输出 session 可令 $N>P\times n$，失败或没有产出 output 的 session 也可令 $N<P\times n$；之后 `_balance_batch()` 还可能补 synthetic padding rows。$P\times n=6$ 只是本章的 happy path。
 
 ### 9.12 两个 KL 开关发生在不同位置
 
@@ -709,7 +709,7 @@ C_clip = 3.0
 L_pg = -masked_mean(L_dual,t, response_mask)
 ```
 
-其中 `r_t` 是当前策略与旧策略在 token `t` 上的概率比，`A_t` 是该 token 的 advantage；`epsilon_low` 和 `epsilon_high` 分别控制 ratio 的下、上裁剪边界；`C_clip > 1` 是只作用于负 advantage 的额外阈值。`L_clip,t` 与 `L_dual,t` 写成待最大化的 token objective，代码中的 `L_pg` 则是它在有效 response token 上取平均后的负值，供优化器最小化。
+其中 $r_t$ 是当前策略与旧策略在第 $t$ 个 token 上的概率比，$A_t$ 是该 token 的 advantage；$\epsilon_{\mathrm{low}}$ 和 $\epsilon_{\mathrm{high}}$ 分别控制 ratio 的下、上裁剪边界；$C_{\mathrm{clip}}>1$ 是只作用于负 advantage 的额外阈值。$L_{\mathrm{clip},t}$ 与 $L_{\mathrm{dual},t}$ 写成待最大化的 token objective，代码中的 $L_{\mathrm{PG}}$ 则是它在有效 response token 上取平均后的负值，供优化器最小化。
 
 最后再按配置加入 entropy 和 KL：
 
@@ -930,7 +930,7 @@ trainer_sync.py::PPOTrainerSync.on_step_end
 1. 当前默认入口是 `TaskRunnerV1 → PPOTrainerSync`，不是 legacy `RayPPOTrainer`。
 2. GRPO 与 PPO 共用 trainer 基础设施；主要变化是 advantage estimator，典型 GRPO 不需要 critic。
 3. V1 trajectory 的真实字段存放在 TransferQueue；数据载体依次是 controller 侧的 `KVBatchMeta`、RPC 中的分 rank `BatchMeta` 和 worker 侧的 `TensorDict`。
-4. `P=2, n=3` 先提交 2 个 prompt group，再产生 6 条 trajectory；ReplayBuffer 的 batch size 与 trajectory row 数不是同一个概念。
+4. $P=2,\ n=3$ 先提交 2 个 prompt group，再产生 6 条 trajectory；ReplayBuffer 的 batch size 与 trajectory row 数不是同一个概念。
 5. reward、old/ref logprob 和 group-relative advantage 都沿相同 TQ keys 逐步“长出”新字段，actor worker 最后读取这些字段做 PPO clipped update。
 6. sync trainer 每步更新结束后把 actor 权重同步给 rollout，下一轮采样才使用新 policy。
 

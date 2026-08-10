@@ -66,8 +66,8 @@ verl 正在快速演进。阅读其他文章时，先判断它讲的是当前 V1
 
 我们反复使用一个小型数学工具 Agent：
 
-- 一个 batch 有 `P=2` 条 prompt；
-- 每条 prompt 采样 `n=3` 次，因此得到 `B=6` 条 trajectory；
+- 一个 batch 有 $P=2$ 条 prompt；
+- 每条 prompt 采样 $n=3$ 次，因此得到 $B=6$ 条 trajectory；
 - 模型可以调用 `calculator`；
 - reward 只在最后一个有效 response token 上记录；
 - 使用 GRPO，在同一 prompt 的 3 个样本内部做相对比较；

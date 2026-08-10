@@ -38,9 +38,9 @@ flowchart TD
 | 字段 | 创建者 | 类型/shape | mask 语义 | 消费者 |
 |---|---|---|---|---|
 | `raw_prompt` | dataset | object/list[message] | 无 | Agent Loop |
-| `responses` | Agent Loop | ragged / `[B,R]` | 由 response mask 限定 | reward、actor |
-| `rm_scores` | reward | `[B,R]` | 有效 response 末端通常非零 | advantage |
-| `advantages` | estimator | `[B,R]` | action token 有效 | actor loss |
+| `responses` | Agent Loop | ragged / $[B,R]$ | 由 response mask 限定 | reward、actor |
+| `rm_scores` | reward | $[B,R]$ | 有效 response 末端通常非零 | advantage |
+| `advantages` | estimator | $[B,R]$ | action token 有效 | actor loss |
 
 只要某一格说不清，先不要启动多 GPU 训练。
 
@@ -740,7 +740,7 @@ parameters + gradients + optimizer states + activations + temporary buffers + KV
 
 ### Policy 层
 
-- 首个 mini-batch 的 old/current log-prob 是否合理接近；ratio≈1 本身正常，不能据此推断 gradient 为零；
+- 首个 mini-batch 的 old/current log-prob 是否合理接近；PPO ratio $\approx 1$ 本身正常，不能据此推断 gradient 为零；
 - PPO ratio 和 clip fraction；
 - KL 是否大到压过 reward；
 - grad norm、learning rate、optimizer step 是否真实发生；

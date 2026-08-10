@@ -31,7 +31,7 @@
 
 ### 1.2 Local update：一次完整的小批 PPO 管道
 
-`parameter_sync_step=K` 时，一个 global step 内会循环 `K` 次 `_step_once()`。每一次都不是单纯的一次 forward，而是：
+`parameter_sync_step` 的值为 $K$ 时，一个 global step 内会循环 $K$ 次 `_step_once()`。每一次都不是单纯的一次 forward，而是：
 
 ```text
 sample
@@ -55,7 +55,7 @@ sample
 
 ### 1.4 Rollout weight version：推理引擎实际加载的策略版本
 
-actor 完成训练不等于 rollout 立刻看到新参数。只有 `CheckpointEngineManager.update_weights(global_steps=K)` 完成，rollout 才发布版本 `K`。一条 partial trajectory 甚至可能前半段由版本 `K-1` 生成、后半段由版本 `K` 生成。
+actor 完成训练不等于 rollout 立刻看到新参数。只有 `CheckpointEngineManager.update_weights(global_steps=K)` 完成，rollout 才发布版本 $K$。一条 partial trajectory 甚至可能前半段由版本 $K-1$ 生成、后半段由版本 $K$ 生成。
 
 后文必须一直区分：
 
@@ -207,7 +207,7 @@ sequenceDiagram
 
 初始化会创建 standalone `LLMServerManager` 和第二个 `CheckpointEngineManager`，并暂时把 hybrid replicas 也加入同一个 global load balancer，见 [`_setup()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L81-L101)。AgentLoop 从这个合并后的 balancer 获取 fully-async client，见 [`get_llm_client()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L129-L136)。
 
-设 `parameter_sync_step=K`，一次周期是：
+设 `parameter_sync_step` 的值为 $K$，一次周期是：
 
 ```text
 standalone rollout 持续生成
@@ -333,7 +333,7 @@ max_global_steps  = 11
 
 ### 6.3 async sampler 仍不会训练半条 trajectory
 
-partial request 可以中断，但 ReplayBuffer 不会把 `running` group 交给 PPO。一个 prompt 的全部 `n` 个 AgentLoop session settle 后，prompt marker 才会从 `running` 变成 `finished` 或 `failure`，见 [`AgentLoopWorkerTQ._run_prompt()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L148)。sample 只从 terminal group 中选择，见 [`_sampleable_terminal_keys()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L319-L326)。
+partial request 可以中断，但 ReplayBuffer 不会把 `running` group 交给 PPO。一个 prompt 的全部 $n$ 个 AgentLoop session settle 后，prompt marker 才会从 `running` 变成 `finished` 或 `failure`，见 [`AgentLoopWorkerTQ._run_prompt()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107-L148)。sample 只从 terminal group 中选择，见 [`_sampleable_terminal_keys()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L319-L326)。
 
 ---
 
@@ -519,13 +519,13 @@ trainer:
 → rollout 只收到最终 θ4
 ```
 
-LR scheduler horizon 会乘以 `K`，因为 scheduler 按 local update 前进，见 [`_init_dataloader()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L710-L729)。但一个 local update 内仍可能有多个 PPO epoch/inner mini-batch，所以不要把 `K` 机械翻译为所有后端都恰好调用 `optimizer.step()` K 次。
+LR scheduler horizon 会乘以 $K$，因为 scheduler 按 local update 前进，见 [`_init_dataloader()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L710-L729)。但一个 local update 内仍可能有多个 PPO epoch/inner mini-batch，所以不要把 $K$ 机械翻译为所有后端都恰好调用 `optimizer.step()` $K$ 次。
 
-另一个重要结果是：staleness threshold 以**发布的 weight version/global-step**为单位，不以 local update 为单位。`K=4` 时，8 个 version 的年龄窗口最多可跨过约 32 次 controller local actor update。
+另一个重要结果是：staleness threshold 以**发布的 weight version/global-step**为单位，不以 local update 为单位。$K=4$ 时，8 个 version 的年龄窗口最多可跨过约 32 次 controller local actor update。
 
-### 9.2 为什么 separate mode 要把 `pi_old` 存到 CPU
+### 9.2 为什么 separate mode 要把 $\pi_{\mathrm{old}}$ 存到 CPU
 
-PPO 希望一个更新周期内的 proximal anchor `π_old` 稳定。若 K 个 local batch 每次都拿“刚更新后的 actor”当 `π_old`，anchor 会不断漂移。
+PPO 希望一个更新周期内的 proximal anchor $\pi_{\mathrm{old}}$ 稳定。若 $K$ 个 local batch 每次都拿“刚更新后的 actor”当 $\pi_{\mathrm{old}}$，anchor 会不断漂移。
 
 `separate_async` 的 decoupled 路径这样做：
 
@@ -569,7 +569,7 @@ actor training engine
 
 它保存 TQ 里的 prompt markers 和 trajectory payload，解决“dataloader 已经取出，但还没有训练”的异步数据。它不是模型 checkpoint。
 
-### 10.4 Separate mode 的 CPU `pi_old` snapshot
+### 10.4 Separate mode 的 CPU $\pi_{\mathrm{old}}$ snapshot
 
 它只是一个 global step 内为了稳定 old policy 使用的内存副本；不写磁盘、没有 optimizer/dataloader，也不会在重启后恢复。
 

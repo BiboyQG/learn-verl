@@ -152,7 +152,7 @@ padding token    → 仅用于对齐，attention/loss mask=0
 | 问题 | 例子 |
 |---|---|
 | 谁创建它？ | rollout / actor / reward loop |
-| 它的 shape 是什么？ | `[B, L_response]` |
+| 它的 shape 是什么？ | $[B,L_{\mathrm{response}}]$ |
 | 它的 mask 是什么？ | `response_mask` |
 | 谁消费它？ | advantage estimator / policy loss |
 

@@ -13,7 +13,7 @@
 1. 区分 actor、reference、critic、rollout，以及 `Role`、`Worker`、`BaseEngine`；
 2. 解释 `TrainingWorker` 如何通过 `EngineRegistry` 选择 FSDP、Megatron、VeOmni 等实现；
 3. 说清 DP、TP、PP、SP/CP、EP 分别切什么，为什么 TP/PP rank 不能拿不同样本；
-4. 从 `P=2, n=3` 推导 global batch、local mini-batch 和 micro-batch 的 shape；
+4. 从 $P=2,\ n=3$ 推导 global batch、local mini-batch 和 micro-batch 的 shape；
 5. 解释为什么“训练侧 forward-only scoring”和“rollout 自回归生成”仍然是两套 engine；
 6. 根据当前源码而不是后端名，判断一个后端能不能训练 critic、能不能使用 PP。
 
@@ -96,14 +96,14 @@ actor 表示当前策略 $\pi_\theta$。它承担两种训练侧计算：
 
 > **公式含义：** 这里把 actor 写成“一套由当前可训练参数决定的概率规则”：给定已经看到的 token，它会为下一个 token 的各个候选值分配概率。
 >
-> **符号说明：** `π`（读作 pi）表示策略，也就是模型的概率分布规则；下标 `θ`（读作 theta）表示 actor 的整组可训练参数。下标表示“这套策略由这些参数决定”，不是相乘。
+> **符号说明：** $\pi$（读作 pi）表示策略，也就是模型的概率分布规则；下标 $\theta$（读作 theta）表示 actor 的整组可训练参数。下标表示“这套策略由这些参数决定”，不是相乘。
 
 - forward-only：默认 decoupled 路径会重算 trajectory 中 token 的 `old_log_probs` 和 entropy；`bypass_mode=True` 时则直接复用 `rollout_log_probs`，跳过这次 actor scoring；
 - train：根据 advantage 和 PPO/GRPO loss 做 backward、更新 $\theta$。
 
 > **公式含义（更新参数）：** 这里的单个符号指 optimizer 要改变 actor 的参数，使策略更符合当前 loss 给出的优化方向。
 >
-> **符号说明：** `θ` 仍是上面那组 actor 参数的统称，不是某一个标量；它通常包含模型中许多权重张量。
+> **符号说明：** $\theta$ 仍是上面那组 actor 参数的统称，不是某一个标量；它通常包含模型中许多权重张量。
 
 当前默认是 `bypass_mode=false`，因此会走上述重算分支；但这不是所有配置的必经步骤。两个分支的真实控制流见 [`trainer_base.py:1479-1516`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1479-L1516)，默认值见 [`rollout_correction.yaml:19-20`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/algorithm/rollout_correction.yaml#L19-L20)。
 
@@ -115,7 +115,7 @@ reference policy 通常表示 $\pi_{\mathrm{ref}}$，用于 KL reward 或 KL los
 
 > **公式含义：** 这个公式表示“作为比较基准的那套策略概率分布”，训练时用它衡量 actor 偏离基准的程度。
 >
-> **符号说明：** `π` 表示策略；下标 `ref` 是 reference（参考）的缩写，用来区分它与正在更新的 actor 策略。这个下标是名称标签，不表示乘法；KL 指两种概率分布之间的差异度量。
+> **符号说明：** $\pi$ 表示策略；下标 $\mathrm{ref}$ 是 reference（参考）的缩写，用来区分它与正在更新的 actor 策略。这个下标是名称标签，不表示乘法；KL 指两种概率分布之间的差异度量。
 
 Engine 的公共配置明确保留了 `forward_only`，见 [`EngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L77-L117)。例如 Megatron 初始化时若 `forward_only=True`，就不创建 optimizer、scheduler 和 checkpoint manager，见 [`megatron/transformer_impl.py:463-469`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/megatron/transformer_impl.py#L463-L469)。
 
@@ -127,7 +127,7 @@ critic 近似价值函数 $V_\phi$，在 GAE 中用来估计 advantage/return。
 
 > **公式含义：** 第一个公式表示 critic 用自己的参数，根据当前 token 上下文预测“从这里继续下去大约能获得多少未来回报”；后面的单个符号专门指这组 critic 参数。
 >
-> **符号说明：** `V` 是 value（价值）函数；下标 `φ`（读作 phi）是 critic 的整组可训练参数，表示价值预测由这些参数决定；单独出现的 `φ` 仍指同一组参数。它与 actor 的 `θ` 分开训练，两者不是同一个变量。
+> **符号说明：** $V$ 是 value（价值）函数；下标 $\phi$（读作 phi）是 critic 的整组可训练参数，表示价值预测由这些参数决定；单独出现的 $\phi$ 仍指同一组参数。它与 actor 的 $\theta$ 分开训练，两者不是同一个变量。
 
 V1 把 critic 配成独立的 `TrainingWorker(model_type="value_model")`，见 [`trainer_base.py:248-271`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L248-L271)。是否需要 critic 由 [`need_critic`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/utils.py#L96-L107) 决定：默认只有 GAE 自动启用；GRPO 一类不依赖 value model 的算法通常不创建 critic。
 
@@ -139,7 +139,7 @@ rollout 的确也执行策略 $\pi$，但工作负载是逐 token 自回归生�
 
 > **公式含义：** 这里的公式泛指 rollout 用来逐 token 采样的策略概率分布，并未指定它是训练前还是训练后的某个参数版本。
 >
-> **符号说明：** `π` 表示策略；这里没有参数下标，意味着作者只强调“它是一套策略”，不在这个句子里区分具体权重版本。
+> **符号说明：** $\pi$ 表示策略；这里没有参数下标，意味着作者只强调“它是一套策略”，不在这个句子里区分具体权重版本。
 
 先用一张表固定边界：
 
@@ -355,7 +355,7 @@ from verl.workers.engine.torchtitan import TorchTitanEngineWithLMHead
 - `ulysses_sequence_parallel_size` 可沿序列维进一步切计算；
 - parameter/optimizer offload、activation checkpoint、remove padding 等降低显存峰值。
 
-FSDP 的 mesh 构造见 [`create_device_mesh`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/utils.py#L35-L53)。Engine 对 controller 暴露的 DP size 是 `world_size / Ulysses_SP`，见 [`fsdp/transformer_impl.py:626-639`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L626-L639)。
+FSDP 的 mesh 构造见 [`create_device_mesh`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/utils.py#L35-L53)。Engine 对 controller 暴露的 DP size 是 $\mathrm{world\_size}/\mathrm{Ulysses\_SP}$，见 [`fsdp/transformer_impl.py:626-639`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L626-L639)。
 
 它是理解统一 engine 最直接的起点：模型仍是 HF 风格，LM/value 两种 head 都有实现，且当前 `model_engine=dp` 组合默认使用 FSDP。需要注意，默认 actor YAML 仍写着切换 FSDP2 的 TODO，而 critic YAML 已把 FSDP1 标为 deprecating；见 [`dp_actor.yaml:22-34`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/actor/dp_actor.yaml#L22-L34) 与 [`dp_critic.yaml:22-36`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/critic/dp_critic.yaml#L22-L36)。因此新实验是否切到 `fsdp2`，应在自己的模型、PyTorch 与硬件组合上验证，而不是只根据名字判断。
 
@@ -388,7 +388,7 @@ MindSpeed 模块当前同时提供两种 NPU 路由：
 
 ### 6.4 VeOmni
 
-[`VeOmniEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L296-L445) 聚焦 FSDP2、Ulysses SP 和 expert parallel。实现中固定 `data_parallel_mode="fsdp2"`，并从 `world_size / ulysses_parallel_size` 推导 DP，再拆 replicate/shard，见 [`veomni/transformer_impl.py:142-173`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/veomni/transformer_impl.py#L142-L173)。
+[`VeOmniEngineConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/engine.py#L296-L445) 聚焦 FSDP2、Ulysses SP 和 expert parallel。实现中固定 `data_parallel_mode="fsdp2"`，并从 $\mathrm{world\_size}/\mathrm{ulysses\_parallel\_size}$ 推导 DP，再拆 replicate/shard，见 [`veomni/transformer_impl.py:142-173`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/veomni/transformer_impl.py#L142-L173)。
 
 它同时注册 LM head 和 value head，因此 actor/ref/critic 的统一路径都可选。仓库当前也有大型 MoE、VL 的 VeOmni 示例；不过端到端可用性仍取决于 VeOmni 自身的模型 registry、kernel 与硬件依赖，不能由 registry 表单独保证。
 
@@ -458,7 +458,7 @@ rank tp0: [H, 2H]
 rank tp1: [H, 2H]
 ```
 
-随后用 all-reduce/all-gather/reduce-scatter 拼出下一步需要的数据。具体切哪一维由模型和 parallel plan 决定；不要机械地认为每层所有 activation 都必然变成 `[B, S, H/TP]`。
+随后用 all-reduce/all-gather/reduce-scatter 拼出下一步需要的数据。具体切哪一维由模型和 parallel plan 决定；不要机械地认为每层所有 activation 都必然变成 $[B,S,H/TP]$。
 
 ### 7.3 Pipeline Parallel：切模型层
 
@@ -486,7 +486,7 @@ $$
 
 > **公式含义：** 在这个简化的 dense Megatron 场景中，训练总进程数大致等于四个并行轴大小的乘积。例如每个轴分别取 2、2、1、1 时，总进程数约为 4。
 >
-> **符号说明：** `world_size` 是参加分布式训练的总进程数，通常一个进程对应一个 GPU rank；`≈` 表示“近似等于”，说明这不是所有后端都必须满足的恒等式；`DP`、`TP`、`PP`、`CP` 分别是数据、张量、流水线、上下文并行的规模；`×` 是乘法，表示把四个独立并行轴的规模组合起来。
+> **符号说明：** $\mathrm{world\_size}$ 是参加分布式训练的总进程数，通常一个进程对应一个 GPU rank；$\approx$ 表示“近似等于”，说明这不是所有后端都必须满足的恒等式；$DP$、$TP$、$PP$、$CP$ 分别是数据、张量、流水线、上下文并行的规模；$\times$ 是乘法，表示把四个独立并行轴的规模组合起来。
 
 但加入 EP、HSDP replicate/shard、virtual PP 或动态 CP 后，各轴可能嵌套或共享 process group。此时必须读取 backend 建出的 device mesh，不能继续盲乘所有配置值。
 
@@ -580,7 +580,7 @@ $$
 
 > **公式含义：** 把单 GPU 的基础 token 配置乘以当前 backend 传入的倍率，得到用来推导 micro-batch 数量的 token 目标值。它回答的是“大约需要拆几批”，不是“每批绝对不得超过多少 token”。
 >
-> **符号说明：** $T_{\mathrm{target}}$ 是用于拆批的目标 token 数，下标 `target` 表示“目标值”；$\mathrm{max\_token\_len\_per\_gpu}$ 就是配置项 `max_token_len_per_gpu`，表示单 GPU 的基础值，直立字体和下划线说明这是一个完整配置名；$s_{\mathrm{backend}}$ 是具体 backend 写入的 `sp_size`，下标 `backend` 表示它由后端决定；$\times$ 是乘号。
+> **符号说明：** $T_{\mathrm{target}}$ 是用于拆批的目标 token 数，下标 $\mathrm{target}$ 表示“目标值”；$\mathrm{max\_token\_len\_per\_gpu}$ 就是配置项 `max_token_len_per_gpu`，表示单 GPU 的基础值，直立字体和下划线说明这是一个完整配置名；$s_{\mathrm{backend}}$ 是具体 backend 写入的 `sp_size`，下标 $\mathrm{backend}$ 表示它由后端决定；$\times$ 是乘号。
 
 $s_{\mathrm{backend}}$ 不是全后端通用的“SP/CP size”，当前实际映射是：
 
@@ -589,19 +589,19 @@ $s_{\mathrm{backend}}$ 不是全后端通用的“SP/CP size”，当前实际�
 - TorchTitan 当前写入的是 `tensor_parallel_size`，不是 CP size，见 [`torchtitan/transformer_impl.py:337-353`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/torchtitan/transformer_impl.py#L337-L353)；
 - Automodel 当前没有写入 `sp_size`，因此公共函数使用默认值 1，见 [`automodel/transformer_impl.py:224-234`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/automodel/transformer_impl.py#L224-L234)。
 
-实现先用 `ceil(total_seqlen / T_target)` 推导批数，再按近似 attention workload 分区，见 [`seqlen_balancing.py:394-438`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/seqlen_balancing.py#L394-L438)。因此动态 micro-batch 的行数不是常量，而且某一批的 token 数可能超过 `T_target`；FSDP 源码对此有明确注释，见 [`fsdp/transformer_impl.py:647-654`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L647-L654)。`same_micro_num_in_dp=True` 会让不同 DP replica 拥有相同 micro-batch 数，避免 collective 或 pipeline schedule 次数不一致。
+实现先用 $\left\lceil \mathrm{total\_seqlen}/T_{\mathrm{target}}\right\rceil$ 推导批数，再按近似 attention workload 分区，见 [`seqlen_balancing.py:394-438`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/seqlen_balancing.py#L394-L438)。因此动态 micro-batch 的行数不是常量，而且某一批的 token 数可能超过 $T_{\mathrm{target}}$；FSDP 源码对此有明确注释，见 [`fsdp/transformer_impl.py:647-654`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L647-L654)。`same_micro_num_in_dp=True` 会让不同 DP replica 拥有相同 micro-batch 数，避免 collective 或 pipeline schedule 次数不一致。
 
 FSDP 还会在非最后一个 micro-batch 暂停梯度同步，只在最后一次 backward 同步，见 [`fsdp/transformer_impl.py:672-748`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L672-L748)。
 
 ---
 
-## 10. `P=2, n=3` 的等长并行推导例子
+## 10. $P=2,\ n=3$ 的等长并行推导例子
 
 假设：
 
-本节只沿用第 04 章的 `P=2, n=3, B=6` 计数关系，为展示 TP 数据复制和固定 shape，特意把六条 trajectory 简化成等长。这不是第 04 章那组 jagged 样本的同一组具体长度：那一例的 `input_ids` 总 token 数是 54，本节的等长变体是 60，见[第 04 章的完整 shape 例子](04_data_and_protocols.md)。
+本节只沿用第 04 章的 $P=2,\ n=3,\ B=6$ 计数关系，为展示 TP 数据复制和固定 shape，特意把六条 trajectory 简化成等长。这不是第 04 章那组 jagged 样本的同一组具体长度：那一例的 `input_ids` 总 token 数是 54，本节的等长变体是 60，见[第 04 章的完整 shape 例子](04_data_and_protocols.md)。
 
-为展示 TP 数据复制关系，这里假设使用当前真正支持 TP 的 engine（例如 Megatron）；若沿用全书默认 FSDP，应把 `TP=1`，并把额外 GPU 放在 DP/FSDP 轴上。
+为展示 TP 数据复制关系，这里假设使用当前真正支持 TP 的 engine（例如 Megatron）；若沿用全书默认 FSDP，应把 $TP=1$，并把额外 GPU 放在 DP/FSDP 轴上。
 
 ```text
 P = 2 prompts
@@ -641,7 +641,7 @@ input_ids.shape ≈ [6, j1]
 input_ids.values().shape = [60]     # 本例恰好等长
 ```
 
-真实样本长度不同时，`values()` 是所有有效 token 的拼接，不会强制等于 `6 × max_length`。数据协议细节见[第 04 章](04_data_and_protocols.md)。
+真实样本长度不同时，`values()` 是所有有效 token 的拼接，不会强制等于 $6 \times \mathrm{max\_length}$。数据协议细节见[第 04 章](04_data_and_protocols.md)。
 
 ### 10.2 按 DP=2 dispatch
 
@@ -694,7 +694,7 @@ local mini-batch [3, 10]
   → optimizer.step() 一次
 ```
 
-`ppo_epochs=2` 会对这 6 条 trajectory 再迭代一次，因此本例总计 **2 次 optimizer update**，而不是 `3 micro-batches × 2 epochs = 6 次`。
+`ppo_epochs=2` 会对这 6 条 trajectory 再迭代一次，因此本例总计 **2 次 optimizer update**，而不是误把 $3 \times 2 = 6$ 当成 6 次更新。
 
 若启用动态 batch，shape 可能变成：
 
@@ -955,7 +955,7 @@ TP/PP/CP rank
 
 > **公式含义：** 这个公式表示 actor 完成一次或多次 optimizer update 后得到的新版参数，rollout server 随后需要加载这版参数。
 >
-> **符号说明：** `θ` 表示 actor 的整组参数；下标 `new` 表示“更新后的新版本”，用来和更新前参数区分。它是版本标签，不表示相乘。
+> **符号说明：** $\theta$ 表示 actor 的整组参数；下标 $\mathrm{new}$ 表示“更新后的新版本”，用来和更新前参数区分。它是版本标签，不表示相乘。
 
 ---
 

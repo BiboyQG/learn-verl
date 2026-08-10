@@ -927,7 +927,7 @@ critic.ppo_micro_batch_size_per_gpu        # 仅当启用 critic
 
 ### 坑 5：GRPO 的 `rollout.n` 仍为 1
 
-GRPO 依赖同一个 prompt 的多条 response 做组内比较。`n=1` 即使某些代码路径能运行，也失去了典型的组相对信号。应显式检查：
+GRPO 依赖同一个 prompt 的多条 response 做组内比较。$n=1$ 即使某些代码路径能运行，也失去了典型的组相对信号。应显式检查：
 
 ```bash
 actor_rollout_ref.rollout.n=4

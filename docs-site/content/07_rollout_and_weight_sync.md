@@ -36,7 +36,7 @@
 推理 rollout：保存适合 decoding 的权重布局和 KV cache；负责用 θ_rollout 生成 token
 ```
 
-actor 到达配置的参数同步点后，需要把新参数从 `θ` 同步到 `θ_rollout`。同步 trainer 通常每个外层 step 做一次；`separate_async` 则可以先在一个外层 step 中完成 [`parameter_sync_step` 次 `_step_once()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L509-L534)，再于 [`on_step_end()` 单次同步](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L161-L165)。这就是 checkpoint engine / weight sync 子系统存在的原因。
+actor 到达配置的参数同步点后，需要把新参数从 $\theta$ 同步到 $\theta_{\mathrm{rollout}}$。同步 trainer 通常每个外层 step 做一次；`separate_async` 则可以先在一个外层 step 中完成 [`parameter_sync_step` 次 `_step_once()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L509-L534)，再于 [`on_step_end()` 单次同步](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_separate_async.py#L161-L165)。这就是 checkpoint engine / weight sync 子系统存在的原因。
 
 ```mermaid
 flowchart LR
@@ -71,7 +71,7 @@ flowchart LR
 
 ### 2.1 自回归生成、logits 和 log probability
 
-假设当前已有 token `x_0, ..., x_t`。语言模型输出下一个 token 的 logits：
+假设当前已有 token $x_0,\ldots,x_t$。语言模型输出下一个 token 的 logits：
 
 $$
 z_{t+1}=f_\theta(x_0,\ldots,x_t)
@@ -86,7 +86,7 @@ $$
 - $x_0,\ldots,x_t$ 表示从第 0 个位置到第 $t$ 个位置的已有 token；$x$ 是 token，数字下标是位置，$\ldots$ 表示省略中间连续的项。
 - 等号表示右边的模型计算结果就是左边的 logits。
 
-经过 temperature、top-k、top-p 等处理后得到采样分布 `π_rollout`，从中采出 `x_{t+1}`。被选中 token 的 log probability 是：
+经过 temperature、top-k、top-p 等处理后得到采样分布 $\pi_{\mathrm{rollout}}$，从中采出 $x_{t+1}$。被选中 token 的 log probability 是：
 
 $$
 \log \pi_{\mathrm{rollout}}(x_{t+1}\mid x_{\le t})
@@ -96,13 +96,13 @@ $$
 
 **符号说明：**
 
-- $\pi_{\mathrm{rollout}}$ 表示推理后端实际用来采样的概率分布；希腊字母 $\pi$ 常用来表示策略，直立的下标 `rollout` 说明这里特指 rollout 时的策略。
+- $\pi_{\mathrm{rollout}}$ 表示推理后端实际用来采样的概率分布；希腊字母 $\pi$ 常用来表示策略，直立的下标 $\mathrm{rollout}$ 说明这里特指 rollout 时的策略。
 - $\log$ 表示自然对数；它把概率转换为 log probability。
 - $x_{t+1}$ 是这一步实际选中的下一个 token，下标含义与上一式相同。
 - $x_{\le t}$ 表示位置不超过 $t$ 的全部 token，也就是 $x_0,\ldots,x_t$；$\le$ 表示“小于或等于”。
 - 竖线 $\mid$ 表示“在……条件下”：右边是已经知道的上下文，左边是要计算概率的 token。
 
-生成一个长度为 `R` 的 response，就有 `R` 个被采样 token，也应有 `R` 个逐 token log probability。verl 的 backend 返回的核心结构正是：
+生成一个长度为 $R$ 的 response，就有 $R$ 个被采样 token，也应有 $R$ 个逐 token log probability。verl 的 backend 返回的核心结构正是：
 
 ```python
 TokenOutput(
@@ -117,7 +117,7 @@ TokenOutput(
 
 ### 2.2 KV cache 是什么
 
-自回归生成第 `t+1` 个 token 时，不需要重新计算前 `t` 个 token 的全部 attention key/value；推理引擎会把它们保存在 **KV cache** 中。它提高生成速度，但会占用大量显存。
+自回归生成第 $t+1$ 个 token 时，不需要重新计算前 $t$ 个 token 的全部 attention key/value；推理引擎会把它们保存在 **KV cache** 中。它提高生成速度，但会占用大量显存。
 
 需要区分两种 cache：
 
@@ -138,7 +138,7 @@ $$
 
 **符号说明：**
 
-- $\mathrm{world\_size}_{\mathrm{replica}}$ 是单个 replica 的总 worker/GPU 数；`world_size` 使用直立字体表示一个完整变量名，下标 `replica` 说明统计范围是“一个 replica”。
+- $\mathrm{world\_size}_{\mathrm{replica}}$ 是单个 replica 的总 worker/GPU 数；$\mathrm{world\_size}$ 使用直立字体表示一个完整变量名，下标 $\mathrm{replica}$ 说明统计范围是“一个 replica”。
 - $TP$ 是 tensor parallel size（张量并行规模），表示一份模型的张量计算拆到多少个 worker/GPU 上。
 - $DP$ 是 data parallel size（数据并行规模），表示有多少份并行处理不同请求或数据的模型副本。
 - $PP$ 是 pipeline parallel size（流水线并行规模），表示模型按层被切成多少个流水线阶段。
@@ -146,7 +146,7 @@ $$
 
 计算发生在 [`RolloutReplica.__init__`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/replica.py#L93-L117)。server manager 再用总 GPU 数除以每个 replica 的 footprint，得到 replica 数量，见 [`LLMServerManager._initialize_llm_servers`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/rollout/llm_server.py#L499-L558)。
 
-例如有 8 张 GPU，`TP=2, DP=1, PP=1`：
+例如有 8 张 GPU，$TP=2,\ DP=1,\ PP=1$：
 
 ```text
 每个 replica 占 2 张 GPU
@@ -154,7 +154,7 @@ $$
 负载均衡器可以把不同 trajectory 分发到 4 个 replica
 ```
 
-当前内置 rollout backend 虽然保留了 `pipeline_model_parallel_size` 字段，但 vLLM、SGLang、TRT-LLM 都会拒绝 `PP > 1`，见 [`RolloutConfig.__post_init__`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L317-L321)。所以当前常见公式实际上是 `TP × DP`。
+当前内置 rollout backend 虽然保留了 `pipeline_model_parallel_size` 字段，但 vLLM、SGLang、TRT-LLM 都会拒绝 $PP>1$，见 [`RolloutConfig.__post_init__`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L317-L321)。所以当前常见公式实际上是 $TP \times DP$。
 
 如果启用 prefill/decode disaggregation，server manager 会先用下式做通用的 footprint bookkeeping：
 
@@ -166,8 +166,8 @@ $$
 
 **符号说明：**
 
-- $TP_{\mathrm{prefill}}$ 是每个 prefill 子副本的张量并行规模，$N_{\mathrm{prefill}}$ 是这类子副本的数量；直立下标 `prefill` 表示“读取并处理完整 prompt”的阶段。
-- $TP_{\mathrm{decode}}$ 是每个 decode 子副本的张量并行规模，$N_{\mathrm{decode}}$ 是这类子副本的数量；直立下标 `decode` 表示“逐个生成后续 token”的阶段。这里的两类“子副本”都位于一个外层 rollout replica 内部。
+- $TP_{\mathrm{prefill}}$ 是每个 prefill 子副本的张量并行规模，$N_{\mathrm{prefill}}$ 是这类子副本的数量；直立下标 $\mathrm{prefill}$ 表示“读取并处理完整 prompt”的阶段。
+- $TP_{\mathrm{decode}}$ 是每个 decode 子副本的张量并行规模，$N_{\mathrm{decode}}$ 是这类子副本的数量；直立下标 $\mathrm{decode}$ 表示“逐个生成后续 token”的阶段。这里的两类“子副本”都位于一个外层 rollout replica 内部。
 - $TP_{\mathrm{prefill}}\times N_{\mathrm{prefill}}$ 和 $TP_{\mathrm{decode}}\times N_{\mathrm{decode}}$ 分别是两个阶段的 worker/GPU 数；$+$ 把两部分资源相加。
 - 圆括号表示先计算括号内的 prefill 与 decode 资源总和，再做外层乘法。
 - $DP$、$PP$ 和 $\times$ 与上一式含义相同：分别是数据并行规模、流水线并行规模和乘法。
@@ -331,9 +331,9 @@ sequenceDiagram
 
 V1 trainer 为每个 prompt 分配唯一 `uid`，把 prompt 状态注册进 TransferQueue，然后 fire-and-forget 地交给 AgentLoop，见 [`trainer_base.py:L1315-L1361`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1315-L1361)。
 
-### 6.2 `n` 不是 backend 一次返回 n 个 completion
+### 6.2 $n$ 不是 backend 一次返回 $n$ 个 completion
 
-在当前 TQ AgentLoop 中，训练 prompt 默认读取 `rollout.n`，验证 prompt 默认读取 `rollout.val_kwargs.n`；如果样本带有 `__rollout_n__`，该值还会覆盖相应默认值。最终得到的 `n` 会为同一 prompt 启动 `n` 个独立 session/task：
+在当前 TQ AgentLoop 中，训练 prompt 默认读取 `rollout.n`，验证 prompt 默认读取 `rollout.val_kwargs.n`；如果样本带有 `__rollout_n__`，该值还会覆盖相应默认值。最终得到的 $n$ 会为同一 prompt 启动 $n$ 个独立 session/task：
 
 ```python
 for session_id in range(n):
@@ -395,7 +395,7 @@ rollout_log_probs:  [lpA,   lpB,   0.0,   0.0,   lpC ]
 
 ## 7. 数据 shape、padding 与 jagged tensor
 
-令 batch size 为 `B`，第 `i` 条样本的 prompt/response 真正长度为 `P_i` 和 `R_i`。
+令 batch size 为 $B$，第 $i$ 条样本的 prompt/response 真正长度为 $P_i$ 和 $R_i$。
 
 ### 7.1 当前 V1 TQ 主路径：每条 trajectory 先保持无 padding
 
@@ -403,13 +403,13 @@ AgentLoop postprocess 为每条 trajectory 产生：
 
 | 字段 | 单样本 shape | 含义 |
 |---|---:|---|
-| `prompts` | `[P_i]` | 初始 prompt token |
-| `responses` | `[R_i]` | 模型 token + 工具观察 token |
-| `input_ids` | `[P_i + R_i]` | 两者拼接 |
-| `position_ids` | `[P_i + R_i]`，VLM 可有额外前缀维 | token 位置 |
-| `response_mask` | `[R_i]` | 模型 token 为 1，工具 token 为 0 |
-| `loss_mask` | `[R_i]` | 当前直接复制 `response_mask` |
-| `rollout_log_probs` | `[R_i]`，可选 | backend 采样时的逐 token logprob |
+| `prompts` | $[P_i]$ | 初始 prompt token |
+| `responses` | $[R_i]$ | 模型 token + 工具观察 token |
+| `input_ids` | $[P_i+R_i]$ | 两者拼接 |
+| `position_ids` | $[P_i+R_i]$，VLM 可有额外前缀维 | token 位置 |
+| `response_mask` | $[R_i]$ | 模型 token 为 1，工具 token 为 0 |
+| `loss_mask` | $[R_i]$ | 当前直接复制 `response_mask` |
+| `rollout_log_probs` | $[R_i]$，可选 | backend 采样时的逐 token logprob |
 
 实现见 [`agent_loop_tq.py:L150-L227`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L150-L227)。代码会临时构造全 1 的 attention mask 来算 position ids，但普通文本 trajectory 不需要保存全局 padded attention mask。
 
@@ -420,7 +420,7 @@ input_ids:      NestedTensor[B, j_i]，其中 j_i = P_i + R_i
 response_mask:  NestedTensor[B, R_i]
 ```
 
-而不是先强行补成 `[B, P_max + R_max]`。
+而不是先强行补成 $[B,P_{\max}+R_{\max}]$。
 
 ### 7.2 一个具体例子
 
@@ -449,21 +449,21 @@ rollout_log_probs [a,  b, 0., 0.,  c]              shape [5]
 FSDP Transformer 实现默认读取 nested `input_ids`：
 
 - `use_remove_padding=True`：取 `input_ids.values()`，把全 batch 的有效 token 打包成 `[1, total_nnz]`；必要时再为 sequence parallel 做少量尾部 padding。
-- `use_remove_padding=False`：临时转成 `[B, max_i(P_i+R_i)]` 的右 padding tensor，并构造 attention mask。
+- `use_remove_padding=False`：临时转成 $[B,\max_i(P_i+R_i)]$ 的右 padding tensor，并构造 attention mask。
 
 源码见 [`transformer_impl.py:L1128-L1243`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L1128-L1243) 和 [`L1245-L1280`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/engine/fsdp/transformer_impl.py#L1245-L1280)。
 
 ### 7.4 为什么 response logprob 的切片要左移一位
 
-模型在位置 `t` 的 logits 预测位置 `t+1` 的 token。因此 full-sequence forward 得到的 logprob 逻辑长度是 `[P_i+R_i]`，但第一枚 response token 的概率位于最后一枚 prompt token 的输出位置。
+模型在位置 $t$ 的 logits 预测位置 $t+1$ 的 token。因此 full-sequence forward 得到的 logprob 逻辑长度是 $[P_i+R_i]$，但第一枚 response token 的概率位于最后一枚 prompt token 的输出位置。
 
-verl 对第 `i` 条序列使用近似如下的切片：
+verl 对第 $i$ 条序列使用近似如下的切片：
 
 ```python
 full_seq_log_probs[seq_end - R_i - 1 : seq_end - 1]
 ```
 
-得到 shape `[R_i]`。实现见 [`response_from_nested`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/padding.py#L196-L212)。这不是 off-by-one bug，而是 causal LM 的 next-token shift。
+得到 shape $[R_i]$。实现见 [`response_from_nested`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/padding.py#L196-L212)。这不是 off-by-one bug，而是 causal LM 的 next-token shift。
 
 ### 7.5 旧 dense 路径长什么样
 
@@ -505,7 +505,7 @@ tag.is_padding = true
 
 ### 8.1 `rollout_log_probs`
 
-它来自 vLLM/SGLang/TRT-LLM 实际采样时的分布，shape 为每条 trajectory 的 `[R_i]`。工具观察位置补 `0.0`，并由 `response_mask=0` 屏蔽。
+它来自 vLLM/SGLang/TRT-LLM 实际采样时的分布，shape 为每条 trajectory 的 $[R_i]$。工具观察位置补 `0.0`，并由 `response_mask=0` 屏蔽。
 
 若 `calculate_log_probs=False`，backend 不必返回它。当前默认 YAML 为 `True`，见 [`rollout.yaml:L231-L233`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/rollout/rollout.yaml#L231-L233)；dataclass 自身的默认值则是 `False`，见 [`rollout.py:L208-L220`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L208-L220)，最终以 Hydra 合成后的运行配置为准。
 
@@ -514,7 +514,7 @@ tag.is_padding = true
 PPO 的 proximal anchor 通常不是直接信任 backend 返回值，而是让训练 actor 对同一条 `input_ids` 再 forward 一次，重新计算 logprob。当前 trainer 流程：
 
 1. actor engine 生成 full-sequence `log_probs`；
-2. `response_from_nested` 切出 `[R_i]`；
+2. `response_from_nested` 切出 $[R_i]$；
 3. 写回 `old_log_probs`；
 4. 若有 `rollout_log_probs`，计算二者差异用于 debug/rollout correction。
 
@@ -526,14 +526,14 @@ old_log_probs = rollout_log_probs
 
 ### 8.3 `ref_log_prob`
 
-这是固定 reference policy 对相同 action token 的 logprob，用于 KL penalty。它同样通过训练/ref engine forward，再切成 `[R_i]`，见 [`trainer_base.py:L1540-L1564`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1540-L1564)。
+这是固定 reference policy 对相同 action token 的 logprob，用于 KL penalty。它同样通过训练/ref engine forward，再切成 $[R_i]$，见 [`trainer_base.py:L1540-L1564`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1540-L1564)。
 
 三者可以概括为：
 
 | 字段 | 哪个模型算 | 什么时候算 | 主要用途 |
 |---|---|---|---|
-| `rollout_log_probs` | 推理 backend 中的 `π_rollout` | token 被采样时 | 记录 behavior policy、校正与 debug |
-| `old_log_probs` | 训练 actor 中的 `π_old` | PPO update 前 | importance ratio 的分母/proximal anchor |
+| `rollout_log_probs` | 推理 backend 中的 $\pi_{\mathrm{rollout}}$ | token 被采样时 | 记录 behavior policy、校正与 debug |
+| `old_log_probs` | 训练 actor 中的 $\pi_{\mathrm{old}}$ | PPO update 前 | importance ratio 的分母/proximal anchor |
 | `ref_log_prob` | 固定 reference policy | PPO update 前 | KL regularization |
 
 即使权重名义上相同，也不要假设 `rollout_log_probs == old_log_probs`。推理 backend 和训练 engine 可能使用不同 kernel、dtype、logits 处理与并行布局。vLLM 的 `logprobs_mode` 默认还是 `processed_logprobs`，见 [`RolloutConfig`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/config/rollout.py#L196-L212)。

@@ -28,7 +28,7 @@
 用户问题 -> 模型调用工具 -> 工具 observation -> 模型继续回答 -> ... -> 终止
 ```
 
-同一个 prompt 可以采样 `n` 条 trajectory。若本次取出 `P` 个 prompt，则正常情况下会产生：
+同一个 prompt 可以采样 $n$ 条 trajectory。若本次取出 $P$ 个 prompt，则正常情况下会产生：
 
 ```text
 trajectory 数量 = P * n
@@ -206,7 +206,7 @@ trajectory key 的格式是：
 ```
 
 - `uid`：原始 prompt 的唯一 id。
-- `session_id`：同一 prompt 的第几次采样，范围通常是 `[0, n)`。
+- `session_id`：同一 prompt 的第几次采样，范围通常是 $[0,n)$。
 - `index`：一次 AgentLoop session 返回多段 output 时的序号。
 
 ReplayBuffer 的源码也用这套格式解释 GRPO group（[`replay_buffer.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/replay_buffer.py#L63-L91)）。
@@ -215,14 +215,14 @@ AgentLoop 写入的核心字段包括：
 
 | 字段 | 单条 trajectory 的 shape/类型 | 含义 |
 | --- | --- | --- |
-| `prompts` | `[prompt_len]` | 最终送入模型的 prompt token ids |
-| `responses` | `[response_len]` | 模型 token 与工具 observation token 组成的 response |
-| `response_mask` | `[response_len]` | 模型生成 token 为 1，工具 observation 为 0 |
-| `loss_mask` | `[response_len]` | 当前实现先等于 `response_mask` |
-| `input_ids` | `[prompt_len + response_len]` | prompt 与 response 拼接 |
-| `position_ids` | `[seq_len]` 或多模态位置 shape | 位置编码索引 |
-| `rollout_log_probs` | `[response_len]`，可选 | rollout engine 记录的 log probability |
-| `rm_scores` | `[response_len]`，可选 | token-level reward，通常只有末端位置非零 |
+| `prompts` | $[L_{\mathrm{prompt}}]$ | 最终送入模型的 prompt token ids |
+| `responses` | $[L_{\mathrm{response}}]$ | 模型 token 与工具 observation token 组成的 response |
+| `response_mask` | $[L_{\mathrm{response}}]$ | 模型生成 token 为 1，工具 observation 为 0 |
+| `loss_mask` | $[L_{\mathrm{response}}]$ | 当前实现先等于 `response_mask` |
+| `input_ids` | $[L_{\mathrm{prompt}}+L_{\mathrm{response}}]$ | prompt 与 response 拼接 |
+| `position_ids` | $[L_{\mathrm{seq}}]$ 或多模态位置 shape | 位置编码索引 |
+| `rollout_log_probs` | $[L_{\mathrm{response}}]$，可选 | rollout engine 记录的 log probability |
+| `rm_scores` | $[L_{\mathrm{response}}]$，可选 | token-level reward，通常只有末端位置非零 |
 | `raw_prompt` 等 | Python object | 数据集原始字段，供 reward/调试使用 |
 
 这些序列保持**实际长度**，并不先 pad 到统一宽度。`list_of_dict_to_tensordict()` 遇到长度不同的 tensor 时，会构造 jagged `NestedTensor`；只有 shape 完全相同才直接 stack（[`tensordict_utils.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/utils/tensordict_utils.py#L918-L949)）。
@@ -291,9 +291,9 @@ sample trajectories
 
 这段顺序是阅读其他模块时最有用的“主干地图”。
 
-## 4.7 Rollout：`P` 个 prompt 如何变成 `P * n` 条轨迹
+## 4.7 Rollout：$P$ 个 prompt 如何变成 $P \times n$ 条轨迹
 
-V1 的 AgentLoopManager 收到 TensorDict 后，将 prompt batch chunk 给多个 worker（[`AgentLoopManagerTQ.generate_sequences`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L230-L257)）。每个 worker 为 batch 中的每个 prompt 建立后台任务，再为该 prompt 启动 `n` 个 AgentLoop session（[`AgentLoopWorkerTQ`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L59-L149)）。
+V1 的 AgentLoopManager 收到 TensorDict 后，将 prompt batch chunk 给多个 worker（[`AgentLoopManagerTQ.generate_sequences`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L230-L257)）。每个 worker 为 batch 中的每个 prompt 建立后台任务，再为该 prompt 启动 $n$ 个 AgentLoop session（[`AgentLoopWorkerTQ`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L59-L149)）。
 
 这意味着 V1 不需要先在 controller 上执行 `repeat(n)`。扩张发生在 AgentLoop worker 内部：
 
@@ -304,7 +304,7 @@ prompt uid=B -> B_0_0, B_1_0, ..., B_(n-1)_0
 
 AgentLoop 的标准输出结构 `AgentLoopOutput` 定义了 `prompt_ids`、`response_ids`、`response_mask`、reward 和 metrics（[`agent_loop.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L90-L157)）。其中 scalar reward 会被放到一个 response token 位置，形成 token-level `rm_scores`。
 
-## 4.8 完整 shape 例子：`P=2, n=3`
+## 4.8 完整 shape 例子：$P=2,\ n=3$
 
 设定：
 
@@ -360,7 +360,7 @@ values           = 一个长度为 24 的连续 token buffer
 logical shape    = [6, j]
 ```
 
-这里的 `j` 表示每一行长度可以不同，而不是“第二维恰好等于某个固定数字”。
+这里的 $j$ 表示每一行长度可以不同，而不是“第二维恰好等于某个固定数字”。
 
 ### 阶段 C：计算 advantage 时临时 padding
 
@@ -448,7 +448,7 @@ GAE 需要：
 token_level_rewards + values + response_mask
 ```
 
-它从 response 尾部向前递推，输出 `[B, R]` 的 `advantages` 与 `returns`（[`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263)）。工具 observation 位置的 `response_mask=0`：该位置自身的 value 与 TD error 会被跳过，已有的 running advantage 会继续向前传递。当前 Agent Loop 写入时令 `loss_mask=response_mask`，但 V1 PPO policy loss [实际直接读取 `response_mask`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L85-L109) 来排除 observation。
+它从 response 尾部向前递推，输出 $[B,R]$ 的 `advantages` 与 `returns`（[`compute_gae_advantage_return`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L215-L263)）。工具 observation 位置的 `response_mask=0`：该位置自身的 value 与 TD error 会被跳过，已有的 running advantage 会继续向前传递。当前 Agent Loop 写入时令 `loss_mask=response_mask`，但 V1 PPO policy loss [实际直接读取 `response_mask`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/workers/utils/losses.py#L85-L109) 来排除 observation。
 
 ### GRPO 路径
 
@@ -742,7 +742,7 @@ controller 更多时候持有 `KVBatchMeta`。序列留在 TransferQueue；dispa
 4. trajectory tag：确认 `prompt_len`、`response_len`、`seq_len`。
 5. mask：分别统计有效 response token 与 loss token。
 6. reward：确认每条 trajectory 的 `rm_scores.sum()`。
-7. group：确认 GRPO 的相同 `uid` 有期望的 `n` 个 distinct `session_id`；一个 session 若产生多段 output，可以包含多个 `index`/trajectory row。
+7. group：确认 GRPO 的相同 `uid` 有期望的 $n$ 个 distinct `session_id`；一个 session 若产生多段 output，可以包含多个 `index`/trajectory row。
 8. update：确认 effective mini-batch、DP size 与本地 batch 的整除关系。
 
 一个实用的 shape 日志模板是：

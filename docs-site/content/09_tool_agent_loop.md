@@ -507,10 +507,10 @@ response_logprobs = [-0.2, -0.1, 0.0, 0.0, 0.0, -0.3, -0.05]
 
 | 段 | 谁产生 | `attention_mask` | `response_mask` | rollout logprob | policy loss |
 |---|---|---:|---:|---|---|
-| 初始 `P` | dataset + template | 1 | 不在 response 中 | 无 | 否 |
-| `A1` | policy | 1 | 1 | 真实生成 logprob | 是 |
-| `O` | environment/tool | 1 | 0 | `0.0` 占位 | 否 |
-| `A2` | policy | 1 | 1 | 真实生成 logprob | 是 |
+| 初始 $P$ | dataset + template | 1 | 不在 response 中 | 无 | 否 |
+| $A_1$ | policy | 1 | 1 | 真实生成 logprob | 是 |
+| $O$ | environment/tool | 1 | 0 | `0.0` 占位 | 否 |
+| $A_2$ | policy | 1 | 1 | 真实生成 logprob | 是 |
 | padding | postprocess | 0 | 0 | `0.0` | 否 |
 
 终态组装时，代码根据 `len(response_mask)` 从累计 `prompt_ids` 的尾部切出整个 interleaved response，见 [`ToolAgentLoop.run()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/tool_agent_loop.py#L176)。这解释了为什么运行中的 `prompt_ids` 不是“永远不变的初始 prompt”。
@@ -519,8 +519,8 @@ response_logprobs = [-0.2, -0.1, 0.0, 0.0, 0.0, -0.3, -0.05]
 
 这里必须区分两类接口：
 
-- 内置且未配置 `custom_reward_function` 的 discriminative RM（disrm）路径不会原样使用 rollout 的完整 `input_ids`。它从 `raw_prompt` 重建 chat，把 `responses = A1 || O || A2` decode 后作为**一个 assistant message**追加，再用 reward-model tokenizer 重新套 chat template；原始 assistant/tool role 边界不会作为结构化 messages 保留。配置自定义 reward function（genrm 也要求如此）时则直接进入 reward manager 的 `run_single()`，不会经过这一步。实现见 [`RewardLoopWorker._preprocess_reward_inputs()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_loop.py#L145-L155) 与 [输入重建逻辑](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_loop.py#L197-L229)；
-- 内置 rule/streaming `NaiveRewardManager` 传给 `compute_score()` 的 `solution_str` 只 decode `responses = A1 || O || A2`，不含初始 prompt。
+- 内置且未配置 `custom_reward_function` 的 discriminative RM（disrm）路径不会原样使用 rollout 的完整 `input_ids`。它从 `raw_prompt` 重建 chat，把 `responses` $= A_1 \mathbin{\Vert} O \mathbin{\Vert} A_2$ decode 后作为**一个 assistant message**追加，再用 reward-model tokenizer 重新套 chat template；原始 assistant/tool role 边界不会作为结构化 messages 保留。配置自定义 reward function（genrm 也要求如此）时则直接进入 reward manager 的 `run_single()`，不会经过这一步。实现见 [`RewardLoopWorker._preprocess_reward_inputs()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_loop.py#L145-L155) 与 [输入重建逻辑](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_loop.py#L197-L229)；
+- 内置 rule/streaming `NaiveRewardManager` 传给 `compute_score()` 的 `solution_str` 只 decode `responses` $= A_1 \mathbin{\Vert} O \mathbin{\Vert} A_2$，不含初始 prompt。
 
 两条路径都基于整段 response，而不是只看最后一个 assistant answer，但上述内置 disrm 路径会经过 decode/re-template。默认 rule manager 调用 `compute_score()` 时只传 `data_source`、`solution_str`、`ground_truth` 和 `extra_info`；自定义 rule function 若需要原始问题，应把它放进 `extra_info`，不能假定它已包含在 `solution_str`，也不能直接读取任意顶层 dataset 字段。若必须使用其他顶层字段，需要自定义 reward manager 显式转发。接口见 [`NaiveRewardManager.run_single()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/reward_loop/reward_manager/naive.py#L34)。reward scalar 随后稀疏放到最后一个真实 response token；GRPO 等算法再按 prompt group 处理 advantage。
 

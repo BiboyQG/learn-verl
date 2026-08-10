@@ -59,9 +59,9 @@ response_mask:   1 1 1 1 1 1       0 0 0 0          1 1 1 1        0 0
 
 | 字段 | 典型 shape | 1 代表什么 | 主要用途 |
 |---|---:|---|---|
-| `attention_mask` | `[B, prompt_len + response_len]` | 是真实 token，不是 padding | Transformer attention |
-| `response_mask` | `[B, response_len]` | 初始值 1 表示 actor 生成 token；rollout rejection 后 1 表示仍被保留的 actor token | policy/KL/entropy/advantage 的有效位置 |
-| `loss_mask` | `[B, response_len]` | Agent Loop 写入时与原始 `response_mask` 相同 | engine 内部的 token 选择和全局 token 计数 |
+| `attention_mask` | $[B,L_{\text{prompt}}+L_{\text{response}}]$ | 是真实 token，不是 padding | Transformer attention |
+| `response_mask` | $[B,L_{\text{response}}]$ | 初始值 1 表示 actor 生成 token；rollout rejection 后 1 表示仍被保留的 actor token | policy/KL/entropy/advantage 的有效位置 |
+| `loss_mask` | $[B,L_{\text{response}}]$ | Agent Loop 写入时与原始 `response_mask` 相同 | engine 内部的 token 选择和全局 token 计数 |
 
 V1 Agent Loop 当前直接令 `loss_mask = response_mask`，见
 [`agent_loop_tq.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L177-L203)。这是**写入 TransferQueue 时的初始相等关系**，不是整个 step 内永远相等。V1 先用原始 `response_mask` 做 trainer-level KL reward shaping，然后 rollout correction 可以执行 rejection、改写 `response_mask`，最后优势估计器才读取改写后的 mask；相应时序见
@@ -78,22 +78,22 @@ V1 Agent Loop 当前直接令 `loss_mask = response_mask`，见
 
 ## 2. 一条训练样本中与 RL 相关的字段
 
-设实际轨迹数为 $B$，padding 后最大 response 长度为 $T$。这里 $B$ 是 rollout 展开后 batch 中的轨迹条数，不一定等于原始 prompt 数；$T$ 是每条 response 对齐后的 token 位置数，这条轴上可以同时有 assistant token、tool observation 和 padding。因此表中的 `[B, T]` 表示“共 $B$ 行、每行 $T$ 个位置”。
+设实际轨迹数为 $B$，padding 后最大 response 长度为 $T$。这里 $B$ 是 rollout 展开后 batch 中的轨迹条数，不一定等于原始 prompt 数；$T$ 是每条 response 对齐后的 token 位置数，这条轴上可以同时有 assistant token、tool observation 和 padding。因此表中的 $[B,T]$ 表示“共 $B$ 行、每行 $T$ 个位置”。
 
 | 字段 | shape | 含义 |
 |---|---:|---|
-| `responses` | `[B, T]` | assistant token、tool observation 和 padding |
-| `response_mask` | `[B, T]` | Agent Loop 初始只选中 assistant token；rollout correction 后只选中未被 rejection 去掉的 assistant token |
-| `loss_mask` | `[B, T]` | 保留 Agent Loop 的原始 assistant-token mask，主要供 engine 选择/计数 |
-| `rm_scores` | `[B, T]` | reward manager 输出的逐 token 分数；可能已包含 DAPO overlong 等 manager-side shaping |
-| `token_level_scores` | `[B, T]` | trainer 对 `rm_scores` 的统一命名，数值直接复制 |
-| `token_level_rewards` | `[B, T]` | trainer-side 可选 KL reward shaping 之后的奖励 |
-| `values` | `[B, T]` | critic 在每个 response 位置的预测；GAE 才必需 |
-| `advantages` | `[B, T]` | actor 更新时每个 post-correction 保留动作的权重；其他位置由 mask 排除 |
-| `returns` | `[B, T]` | critic target，或为了统一接口保存的占位结果 |
-| `old_log_probs` | `[B, T]` | PPO 更新开始前的 actor log-probability |
-| `ref_log_prob` | `[B, T]` | 冻结 reference policy 的 log-probability |
-| `uid` | `[B]`，非 tensor/对象数组 | 同一个原始 prompt 的分组 ID |
+| `responses` | $[B,T]$ | assistant token、tool observation 和 padding |
+| `response_mask` | $[B,T]$ | Agent Loop 初始只选中 assistant token；rollout correction 后只选中未被 rejection 去掉的 assistant token |
+| `loss_mask` | $[B,T]$ | 保留 Agent Loop 的原始 assistant-token mask，主要供 engine 选择/计数 |
+| `rm_scores` | $[B,T]$ | reward manager 输出的逐 token 分数；可能已包含 DAPO overlong 等 manager-side shaping |
+| `token_level_scores` | $[B,T]$ | trainer 对 `rm_scores` 的统一命名，数值直接复制 |
+| `token_level_rewards` | $[B,T]$ | trainer-side 可选 KL reward shaping 之后的奖励 |
+| `values` | $[B,T]$ | critic 在每个 response 位置的预测；GAE 才必需 |
+| `advantages` | $[B,T]$ | actor 更新时每个 post-correction 保留动作的权重；其他位置由 mask 排除 |
+| `returns` | $[B,T]$ | critic target，或为了统一接口保存的占位结果 |
+| `old_log_probs` | $[B,T]$ | PPO 更新开始前的 actor log-probability |
+| `ref_log_prob` | $[B,T]$ | 冻结 reference policy 的 log-probability |
+| `uid` | $[B]$，非 tensor/对象数组 | 同一个原始 prompt 的分组 ID |
 
 V1 trainer 在优势计算前把 `rm_scores` 映射为 `token_level_scores`，再决定是否加入 KL，见
 [`trainer_base.py::_compute_advantage`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1588-L1629)。
@@ -144,7 +144,7 @@ advantages + returns
 [`trainer_base.py::_step_once`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L536-L553) 和
 [`trainer_base.py::_compute_reward_colocate`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/trainer_base.py#L1374-L1426)。
 
-两条路径最终都会产生稀疏 terminal `rm_scores`：先创建全 0 的 `[B,T]` tensor，再把标量分数放到最后一个有效 response 位置。等价的核心操作是：
+两条路径最终都会产生稀疏 terminal `rm_scores`：先创建全 0 的 $[B,T]$ tensor，再把标量分数放到最后一个有效 response 位置。等价的核心操作是：
 
 ```python
 reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
@@ -235,7 +235,7 @@ $$
 
 **符号说明**：$t$ 是 token 位置；$r_t$ 是该位置 shaping 后的 reward；$\mathrm{score}_t$ 是该位置的 `token_level_scores`，使用直立英文 `score` 是为了避免与第 1 节表示状态的 $s_t$ 混淆；$\beta$（beta）是 KL controller 的当前系数，按惩罚语义应配为非负数，且越大就越强地限制 old policy 偏离 reference policy。但当前 `KLControlConfig`、fixed controller 和 adaptive controller 都没有校验或 clamp 这个符号，见
 [`algorithm.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/config/algorithm.py#L24-L39) 和
-[`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L153-L181)；负值配置会破坏上述惩罚直觉。当前配置 `kl_penalty: kl` 精确计算 `old_log_probs - ref_log_prob`，所以 $\widehat{D}_{KL,t}$ 的方向是“old/proximal policy 减 reference policy”，不是反向；当动作确实采样自 old policy 时，其期望对应 forward KL，即 $D_{KL}(\pi_{\mathrm{old}}\|\pi_{\mathrm{ref}})$，双竖线表示从左侧分布到右侧分布的有向比较。$D_{KL}$ 表示 Kullback–Leibler divergence，上方的“帽子”表示它是单个已采样 token 的估计量而非完整分布求和，下标 `KL,t` 分别标出算子种类和 token 位置。单个 token 的估计值可能为负；若数据来自不同的 rollout policy 且没有相应 importance correction，样本均值也不能严格称为这个 old-to-reference KL。
+[`core_algos.py`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/core_algos.py#L153-L181)；负值配置会破坏上述惩罚直觉。当前配置 `kl_penalty: kl` 精确计算 `old_log_probs - ref_log_prob`，所以 $\widehat{D}_{KL,t}$ 的方向是“old/proximal policy 减 reference policy”，不是反向；当动作确实采样自 old policy 时，其期望对应 forward KL，即 $D_{KL}(\pi_{\mathrm{old}}\|\pi_{\mathrm{ref}})$，双竖线表示从左侧分布到右侧分布的有向比较。$D_{KL}$ 表示 Kullback–Leibler divergence，上方的“帽子”表示它是单个已采样 token 的估计量而非完整分布求和，下标 $\mathrm{KL},t$ 分别标出算子种类和 token 位置。单个 token 的估计值可能为负；若数据来自不同的 rollout policy 且没有相应 importance correction，样本均值也不能严格称为这个 old-to-reference KL。
 
 代码对应：
 
@@ -343,14 +343,14 @@ $$
 再把未来 TD error 做指数加权：
 
 $$
-A_t^{GAE}
+A_t^{\mathrm{GAE}}
 =\delta_t+(\gamma\lambda)\delta_{t+1}
 +(\gamma\lambda)^2\delta_{t+2}+\cdots.
 $$
 
 **公式含义**：时刻 $t$ 的 GAE advantage 不只看当前 TD error，还把以后各步的 TD error 加进来。只有当 $|\gamma\lambda|<1$ 时，距离越远，权重才按相同倍率几何缩小；当前默认 `gamma=1, lam=1`，乘积为 1，默认并不衰减。连续同号的 TD error 会累积，异号则可能互相抵消。
 
-**符号说明**：$A_t^{GAE}$ 是时刻 $t$ 的 generalized advantage estimate，右上角 `GAE` 是算法名称而不是乘方；$\delta_t$、$\delta_{t+1}$、$\delta_{t+2}$ 分别是当前、下一步、下两步的 TD error。$\lambda$（lambda）是控制“看多远”的 GAE 参数；$\gamma\lambda$ 是每往后一步共同乘上的权重倍率，绝对值小于 1 才是衰减倍率；右上角 2 表示该倍率连乘两次；$\cdots$ 表示同样规律继续到轨迹结束。
+**符号说明**：$A_t^{\mathrm{GAE}}$ 是时刻 $t$ 的 generalized advantage estimate，右上角 $\mathrm{GAE}$ 是算法名称而不是乘方；$\delta_t$、$\delta_{t+1}$、$\delta_{t+2}$ 分别是当前、下一步、下两步的 TD error。$\lambda$（lambda）是控制“看多远”的 GAE 参数；$\gamma\lambda$ 是每往后一步共同乘上的权重倍率，绝对值小于 1 才是衰减倍率；右上角 2 表示该倍率连乘两次；$\cdots$ 表示同样规律继续到轨迹结束。
 
 递推写法是：
 
@@ -360,7 +360,7 @@ $$
 
 **公式含义**：从后往前算时，当前 advantage 等于当前 TD error，再加上折扣后的下一步 advantage；它与上面的展开式是同一件事。
 
-**符号说明**：$A_t$ 与 $A_{t+1}$ 分别是当前和下一时刻的 advantage；$\delta_t$ 是当前 TD error；$\gamma\lambda$ 是折扣因子 $\gamma$ 与 GAE 参数 $\lambda$ 的乘积。这里省略上标 `GAE` 只是简写，并没有换成别的 advantage；从轨迹末端开始反推时，末端之后的 advantage 初值设为 0。
+**符号说明**：$A_t$ 与 $A_{t+1}$ 分别是当前和下一时刻的 advantage；$\delta_t$ 是当前 TD error；$\gamma\lambda$ 是折扣因子 $\gamma$ 与 GAE 参数 $\lambda$ 的乘积。这里省略上标 $\mathrm{GAE}$ 只是简写，并没有换成别的 advantage；从轨迹末端开始反推时，末端之后的 advantage 初值设为 0。
 
 最后给 critic 的 target 是：
 
@@ -438,9 +438,9 @@ response_mask: 1          0          1
 
 参数直觉：
 
-- `gamma` 越小，越不看重遥远 reward。
-- `lambda=0` 更接近一步 TD：方差低，但更依赖 critic 是否准确。
-- `lambda=1` 更接近 Monte Carlo return：偏差低，但方差高。
+- $\gamma$ 越小，越不看重遥远 reward。
+- $\lambda=0$ 更接近一步 TD：方差低，但更依赖 critic 是否准确。
+- $\lambda=1$ 更接近 Monte Carlo return：偏差低，但方差高。
 - 当前默认 `gamma=1, lam=1`，适合很多短 episode、稀疏 terminal reward 场景，但不是永远最优。
 
 ---
@@ -515,7 +515,7 @@ $$
 R = [1.0, 0.0, 0.5]
 ```
 
-样本均值和样本标准差都是 0.5。保留默认稳定项 `epsilon=1e-6` 时：
+样本均值和样本标准差都是 0.5。保留默认稳定项 $\epsilon=10^{-6}$ 时：
 
 ```text
 A = [(1.0 - 0.5) / (0.5 + 1e-6),
@@ -666,7 +666,7 @@ response_mask:     1             0                 1
 reward:            0             0                 1
 ```
 
-`gamma=1` 时当前代码得到的 raw returns 是：
+$\gamma=1$ 时当前代码得到的 raw returns 是：
 
 ```text
 returns = [0, 1, 1]

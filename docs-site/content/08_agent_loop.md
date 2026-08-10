@@ -247,7 +247,7 @@ V1 trainer 初始化 [`LLMServerManager`](https://github.com/verl-project/verl/b
 
 这也是为什么 V1 的 `generate_sequences()` 没有直接返回 rollout batch。
 
-### 5.5 一个 prompt 产生 `n` 个 session
+### 5.5 一个 prompt 产生 $n$ 个 session
 
 [`AgentLoopWorkerTQ._run_prompt()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/trainer/ppo/v1/agent_loop_tq.py#L107) 读取：
 
@@ -544,7 +544,7 @@ response_mask           1              0               1            0
 
 文本模型通常根据 `attention_mask` 计算连续 position。所有真实 observation token 都会占用位置，因为它们确实处在模型上下文中。
 
-multimodal processor 如果提供 `get_rope_index()`，position ids 可能是多通道 tensor，而不再是简单的 `[B, L]`。当前实现见 [`_compute_position_ids()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L914)。不要在自定义 manager 中硬编码 position tensor rank。
+multimodal processor 如果提供 `get_rope_index()`，position ids 可能是多通道 tensor，而不再是简单的 $[B,L]$。当前实现见 [`_compute_position_ids()`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/experimental/agent_loop/agent_loop.py#L914)。不要在自定义 manager 中硬编码 position tensor rank。
 
 ---
 

@@ -443,13 +443,13 @@ registry 位于 [`decorator.py:307-331`](https://github.com/verl-project/verl/bl
 | 模式 | Controller 输入 | 每个 rank 收到什么 | collect 结果 |
 |---|---|---|---|
 | `ONE_TO_ALL` | 一个普通值 | 所有 rank 收到同一个值 | 所有 rank 结果列表 |
-| `ALL_TO_ALL` | 通常是一 rank一份的 list | `list[i]` 给 rank `i` | 原样结果列表 |
-| `DP_COMPUTE` | 调用方已经准备好 N 份 | 第 `i` 份给 rank `i` | per-rank list |
+| `ALL_TO_ALL` | 通常是一 rank一份的 list | `list[i]` 给 rank $i$ | 原样结果列表 |
+| `DP_COMPUTE` | 调用方已经准备好 N 份 | 第 $i$ 份给 rank $i$ | per-rank list |
 | `DP_COMPUTE_PROTO` | 一个 batch | 沿 batch 维切 N 份 | 沿 batch 维 concat |
 | `DP_COMPUTE_PROTO_WITH_FUNC` | 函数 + batch | 函数广播，batch 切分 | concat |
 | `DP_COMPUTE_METRIC` | 一个 batch | 沿 batch 维切 N 份 | 保留各 rank metrics |
 
-`ALL_TO_ALL` 的名字不要按 MPI collective 理解。这里没有执行 all-to-all 通信；dispatch 函数只是保持参数不变。随后 `execute_all_async()` 只有在**所有位置参数和 kwargs 值都是长度等于 world size 的 list**时，才会逐 rank 取第 `i` 项；否则会把整个参数组合广播到所有 rank，见 [`ray/base.py:877-894`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L877)。
+`ALL_TO_ALL` 的名字不要按 MPI collective 理解。这里没有执行 all-to-all 通信；dispatch 函数只是保持参数不变。随后 `execute_all_async()` 只有在**所有位置参数和 kwargs 值都是长度等于 world size 的 list**时，才会逐 rank 取第 $i$ 项；否则会把整个参数组合广播到所有 rank，见 [`ray/base.py:877-894`](https://github.com/verl-project/verl/blob/d33ddd7140f44d392e0e10b48a8902651a1340f4/verl/single_controller/ray/base.py#L877)。
 
 ### 6.2 最小例子：一个 batch 怎样被四个 worker 切开？
 

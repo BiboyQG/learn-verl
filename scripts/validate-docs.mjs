@@ -58,12 +58,29 @@ for (const route of routes) {
 }
 
 const html = pages.join("\n");
+const documents = pages.map((page) => new JSDOM(page).window.document);
 const sourceLinkPrefix = `https://github.com/verl-project/verl/blob/${commit}/`;
 const sourceTreePrefix = `https://github.com/verl-project/verl/tree/${commit}/`;
 const sourceLinkCount =
   html.split(sourceLinkPrefix).length - 1 + html.split(sourceTreePrefix).length - 1;
-const katexCount = (html.match(/class="katex/g) ?? []).length;
-const katexErrorCount = (html.match(/class="katex-error/g) ?? []).length;
+const katexNodes = documents.flatMap((document) => [...document.querySelectorAll("span.katex")]);
+const displayKatexCount = katexNodes.filter((node) => node.closest(".katex-display")).length;
+const inlineKatexCount = katexNodes.length - displayKatexCount;
+const katexErrorCount = documents.reduce(
+  (count, document) => count + document.querySelectorAll(".katex-error").length,
+  0,
+);
+const prerequisitesDocument = documents[routes.indexOf("01_prerequisites")];
+const prerequisitesInlineTex = [...prerequisitesDocument.querySelectorAll("span.katex")]
+  .filter((node) => !node.closest(".katex-display"))
+  .map(
+    (node) =>
+      node.querySelector('annotation[encoding="application/x-tex"]')?.textContent?.trim() ?? "",
+  );
+const requiredPrerequisitesInlineTex = [String.raw`\pi_\theta`, String.raw`\theta`];
+const rawPrerequisitesMathCode = [...prerequisitesDocument.querySelectorAll("code")]
+  .map((node) => node.textContent ?? "")
+  .filter((value) => /\\(?:pi|theta)\b/.test(value));
 const javascriptDirectory = path.join(build, "assets/js");
 const javascriptFiles = (await readdir(javascriptDirectory)).filter((name) => name.endsWith(".js"));
 const javascript = (
@@ -76,11 +93,25 @@ const mermaidCount = (javascript.match(/\.mermaid,\{value:/g) ?? []).length;
 if (sourceLinkCount < 850) {
   throw new Error(`Expected at least 850 pinned source links, found ${sourceLinkCount}.`);
 }
-if (katexCount < 50) {
-  throw new Error(`Expected at least 50 KaTeX nodes, found ${katexCount}.`);
+if (inlineKatexCount < 1000) {
+  throw new Error(`Expected at least 1000 inline KaTeX nodes, found ${inlineKatexCount}.`);
+}
+if (displayKatexCount < 50) {
+  throw new Error(`Expected at least 50 display KaTeX nodes, found ${displayKatexCount}.`);
 }
 if (katexErrorCount > 0) {
   throw new Error(`Found ${katexErrorCount} KaTeX rendering errors.`);
+}
+for (const formula of requiredPrerequisitesInlineTex) {
+  if (!prerequisitesInlineTex.includes(formula)) {
+    throw new Error(`Expected 01_prerequisites to render inline KaTeX for ${formula}.`);
+  }
+}
+if (rawPrerequisitesMathCode.length > 0) {
+  throw new Error(
+    "Found raw \\pi or \\theta TeX inside <code> in 01_prerequisites: " +
+      rawPrerequisitesMathCode.slice(0, 3).join(", "),
+  );
 }
 if (mermaidCount < 37) {
   throw new Error(`Expected at least 37 Mermaid markers, found ${mermaidCount}.`);
@@ -97,5 +128,6 @@ if (!hasSearchIndex) {
 
 console.log(
   `Validated ${routes.length} routes, ${sourceLinkCount} pinned source links, ` +
-    `${katexCount} KaTeX nodes, and ${parsedMermaidCount} parsed Mermaid diagrams.`,
+    `${inlineKatexCount} inline and ${displayKatexCount} display KaTeX nodes, ` +
+    `and ${parsedMermaidCount} parsed Mermaid diagrams.`,
 );
